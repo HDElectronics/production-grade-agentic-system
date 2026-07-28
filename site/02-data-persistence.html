@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 — Data persistence · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 02 · Foundations</div>
+<h1>Data persistence</h1>
+<p class="lede">
+  Two type systems, deliberately kept apart: <strong>models</strong> describe what lives in Postgres,
+  <strong>schemas</strong> describe what crosses the network. Collapsing them is how password hashes end up
+  in JSON responses.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  An agentic system is not a JSON blob store. There are hard relationships — a user owns sessions, a session
+  anchors a LangGraph thread, a thread owns checkpoints — and violating them corrupts conversations rather
+  than just losing a row. At the same time, the shape you persist is <em>not</em> the shape you should return:
+  the <code>User</code> row carries <code>hashed_password</code>, and the API must never emit it.
+</p>
+<p>The stack here is <strong>SQLModel</strong>, which is SQLAlchemy (persistence) and Pydantic (validation)
+  in one class hierarchy — so the two worlds can share syntax without sharing objects.</p>
+
+<h2 id="base">The base model (DRY)</h2>
+<p>
+  Every table needs a creation timestamp. Copy-pasting that field into every model is how one table ends up
+  with a naive local timestamp while the rest are UTC, and how a 2 a.m. incident becomes unreadable.
+</p>
+
+<div class="code" data-lang="python" data-file="src/data/models/base.py">
+<pre>
+from datetime import datetime, UTC
+from sqlmodel import Field, SQLModel
+
+
+class BaseModel(SQLModel):
+    """Abstract base adding common fields to all tables."""
+
+    # Always UTC in production. Timezone-naive timestamps are a
+    # debugging tax you pay forever.
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Note the <code>default_factory</code></span>
+  <p><code>default=datetime.now(UTC)</code> would evaluate <em>once</em>, at import time, and stamp every row
+  ever created with the moment your process booted. The lambda defers evaluation to insert time. This is one of
+  the most common Python bugs that never throws an exception.</p>
+</div>
+
+<h2 id="entities">Entity definition</h2>
+
+<h3>User — with the crypto encapsulated</h3>
+<div class="code" data-lang="python" data-file="src/data/models/user.py">
+<pre>
+from typing import TYPE_CHECKING, List
+import bcrypt
+from sqlmodel import Field, Relationship
+from src.data.models.base import BaseModel
+
+if TYPE_CHECKING:                       # type-only import: no circular import at runtime
+    from src.data.models.session import Session
+
+
+class User(BaseModel, table=True):
+    id: int = Field(default=None, primary_key=True)
+
+    # unique -&gt; a DB-level guarantee, not just an application check
+    # index  -&gt; login does WHERE email = ? on every request
+    email: str = Field(unique=True, index=True)
+
+    hashed_password: str                # never the plaintext
+
+    sessions: List["Session"] = Relationship(back_populates="user")
+
+    def verify_password(self, password: str) -&gt; bool:
+        return bcrypt.checkpw(password.encode("utf-8"),
+                              self.hashed_password.encode("utf-8"))
+
+    @staticmethod
+    def hash_password(password: str) -&gt; str:
+        salt = bcrypt.gensalt()         # a fresh salt per password
+        return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+</pre>
+</div>
+
+<p>
+  Putting <code>verify_password</code> and <code>hash_password</code> <em>on the model</em> is the point.
+  No route handler ever gets a chance to invent its own comparison, and nobody writes
+  <code>if user.hashed_password == password</code>. The unsafe operation is simply not reachable.
+</p>
+
+<div class="note warn">
+  <span class="note-title">bcrypt.checkpw is constant-time by design</span>
+  <p>It compares the full digest rather than short-circuiting on the first differing byte, so an attacker
+  can't measure response times to learn the hash prefix. A hand-rolled <code>==</code> on hashes leaks
+  exactly that.</p>
+</div>
+
+<h3>Session — the conversation boundary</h3>
+<div class="code" data-lang="python" data-file="src/data/models/session.py">
+<pre>
+class Session(BaseModel, table=True):
+    # String UUIDs, not autoincrement ints. Session ids travel in tokens
+    # and URLs; sequential ids let anyone enumerate their neighbours' chats.
+    id: str = Field(primary_key=True)
+
+    user_id: int = Field(foreign_key="user.id")
+    name: str = Field(default="")               # friendly label, e.g. "Recipe ideas"
+
+    user: "User" = Relationship(back_populates="sessions")
+</pre>
+</div>
+
+<h3>Thread — the anchor for LangGraph state</h3>
+<div class="code" data-lang="python" data-file="src/data/models/thread.py">
+<pre>
+class Thread(SQLModel, table=True):
+    """Lightweight anchor for LangGraph checkpoints.
+
+    The state blob itself is written by AsyncPostgresSaver into
+    checkpoints / checkpoint_blobs / checkpoint_writes. This table
+    exists so the application can validate that a thread exists
+    without reaching into the checkpointer's private tables.
+    """
+    id: str = Field(primary_key=True)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+</pre>
+</div>
+
+<p>The resulting schema — note the cascade and the two indexes:</p>
+
+<div class="code" data-lang="sql" data-file="schema.sql">
+<pre>
+CREATE TABLE IF NOT EXISTS user (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    email           TEXT UNIQUE NOT NULL,
+    hashed_password TEXT NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session (
+    id         TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES user(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS thread (
+    id         TEXT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_email      ON user(email);
+CREATE INDEX IF NOT EXISTS idx_session_user_id ON session(user_id);
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Where the rest of the tables come from</span>
+  <p><code>checkpoints</code>, <code>checkpoint_blobs</code> and <code>checkpoint_writes</code> are created by
+  <code>await checkpointer.setup()</code> at agent startup, not by this file. They are listed in
+  <code>settings.CHECKPOINT_TABLES</code> so <code>clear_chat_history()</code> knows what to delete —
+  see <a href="05-agent-architecture.html">layer 05</a>. The pgvector collection is created by mem0ai.</p>
+</div>
+
+<h2 id="dto">Data Transfer Objects</h2>
+<p>
+  A DTO is the contract between your API and the outside world. Returning ORM objects directly couples your
+  wire format to your table layout — rename a column and you break every client — and leaks whatever fields
+  happen to exist.
+</p>
+
+<div class="code" data-lang="python" data-file="src/data/schemas/auth.py">
+<pre>
+import re
+from datetime import datetime
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
+
+
+class UserCreate(BaseModel):
+    """Registration input."""
+    email: EmailStr = Field(..., description="User's email address")
+
+    # SecretStr renders as '**********' in reprs and tracebacks, so an
+    # unhandled exception can't print the password into your logs.
+    password: SecretStr = Field(..., min_length=8, max_length=64)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, v: SecretStr) -&gt; SecretStr:
+        password = v.get_secret_value()
+        if len(password) &lt; 8:
+            raise ValueError("Password must be at least 8 characters long")
+        if not re.search(r"[A-Z]", password):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not re.search(r"[0-9]", password):
+            raise ValueError("Password must contain at least one number")
+        if not re.search(r'[!@#$%^&amp;*(),.?":{}|&lt;&gt;]', password):
+            raise ValueError("Password must contain at least one special character")
+        return v
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = Field(default="bearer")
+    expires_at: datetime
+
+
+class UserResponse(BaseModel):
+    """Public profile. Note what is NOT here: hashed_password."""
+    id: int
+    email: str
+    token: Token
+</pre>
+</div>
+
+<h2 id="toy-leak">Toy example: what the DTO actually stops</h2>
+<p>
+  Same database row, two serialisation strategies. Flip the switch and watch the response body change.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">DTO leak inspector</span>
+    <span class="widget-tag">side by side</span>
+  </div>
+  <div class="widget-body">
+    <div class="btn-row" style="margin-bottom:14px">
+      <button class="btn" id="leak-orm">return user  <span class="dim">(ORM object)</span></button>
+      <button class="btn ghost" id="leak-dto">return UserResponse(...)</button>
+    </div>
+    <div class="out" id="leak-out"></div>
+    <div id="leak-note" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<h2 id="toy-password">Toy example: the password policy, live</h2>
+<p>
+  Every rule below is the exact regex from <code>UserCreate.validate_password</code>. Pydantic raises on the
+  <em>first</em> failure, so the API returns one message at a time — the panel shows all of them so you can
+  see the whole policy at once.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Password validator</span>
+    <span class="widget-tag">runs the real rules</span>
+  </div>
+  <div class="widget-body">
+    <div class="ctrl" style="margin-bottom:14px">
+      <label for="pw">password</label>
+      <input type="text" id="pw" value="hunter2" style="width:100%;max-width:420px">
+    </div>
+    <div class="out" id="pw-out"></div>
+    <div class="widget-note">
+      Try <code>Passw0rd!</code> (passes), <code>PASSWORD123!</code> (passes — the policy has no lowercase rule),
+      and a 65-character string (fails on <code>max_length</code> before any validator runs).
+    </div>
+  </div>
+</div>
+
+<h2 id="chat-schemas">Chat schemas</h2>
+<p>
+  The chat DTOs do double duty: they define the wire format <em>and</em> they are the first line of input
+  defence, because a Pydantic validator runs before your handler body does.
+</p>
+
+<div class="code" data-lang="python" data-file="src/data/schemas/chat.py">
+<pre>
+class Message(BaseModel):
+    role: Literal["user", "assistant", "system"] = Field(...)
+    content: str = Field(..., min_length=1, max_length=3000)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, v: str) -&gt; str:
+        if re.search(r"&lt;script.*?&gt;.*?&lt;/script&gt;", v, re.IGNORECASE | re.DOTALL):
+            raise ValueError("Content contains potentially harmful script tags")
+        return v
+
+
+class ChatRequest(BaseModel):
+    messages: List[Message] = Field(..., min_length=1)
+
+
+class ChatResponse(BaseModel):
+    messages: List[Message]
+
+
+class StreamResponse(BaseModel):
+    """One Server-Sent Events frame."""
+    content: str = Field(default="")
+    done: bool = Field(default=False)
+</pre>
+</div>
+
+<p>Three constraints are doing real work here:</p>
+<ul>
+  <li><code>Literal[...]</code> on <code>role</code> — a client cannot invent a <code>"developer"</code> role and
+    confuse the model's chat template.</li>
+  <li><code>max_length=3000</code> — a bound on the per-message token cost before the request reaches the LLM.
+    Combined with the trimming in <a href="03-security.html">layer 03</a>, cost per request is capped from both ends.</li>
+  <li><code>min_length=1</code> on <code>messages</code> — the agent indexes <code>messages[-1]</code> to build
+    the memory query; an empty list would be an <code>IndexError</code> deep inside the graph.</li>
+</ul>
+
+<div class="note warn">
+  <span class="note-title">The script-tag validator is defence in depth, not the defence</span>
+  <p>A regex for <code>&lt;script&gt;…&lt;/script&gt;</code> catches the naive case and nothing else — it does not
+  stop <code>&lt;img onerror=…&gt;</code>. The actual protection is the escaping in
+  <code>sanitize_string()</code> (<a href="03-security.html">layer 03</a>) plus not rendering model output as
+  raw HTML. Treat this validator as a cheap tripwire.</p>
+</div>
+
+<h2 id="graph-state">The graph state schema</h2>
+<p>
+  LangGraph passes one state object between nodes. Declaring it as a Pydantic model — rather than a loose dict —
+  means a typo in a node's return value fails immediately instead of silently creating a new key.
+</p>
+
+<div class="code" data-lang="python" data-file="src/data/schemas/graph.py">
+<pre>
+from typing import Annotated
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
+
+
+class GraphState(BaseModel):
+    # add_messages is a REDUCER. Without it, a node returning
+    # {"messages": [x]} would REPLACE the history with [x].
+    # With it, LangGraph appends and de-duplicates by message id.
+    messages: Annotated[list, add_messages] = Field(default_factory=list)
+
+    # Retrieved from mem0ai before the graph runs; injected into the
+    # system prompt by the chat node.
+    long_term_memory: str = Field(default="")
+</pre>
+</div>
+
+<h2 id="toy-reducer">Toy example: with and without the reducer</h2>
+<p>
+  Two nodes each return one message. The only difference between the columns is the
+  <code>Annotated[list, add_messages]</code> annotation.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">State reducer comparison</span>
+    <span class="widget-tag">step through</span>
+  </div>
+  <div class="widget-body">
+    <div class="btn-row" style="margin-bottom:14px">
+      <button class="btn" id="red-step">Run next node →</button>
+      <button class="btn ghost" id="red-reset">Reset</button>
+    </div>
+    <div class="two-col">
+      <div>
+        <h4 style="margin-top:0">messages: list <span class="dim">(no reducer)</span></h4>
+        <div class="out" id="red-plain"></div>
+      </div>
+      <div>
+        <h4 style="margin-top:0">Annotated[list, add_messages]</h4>
+        <div class="out" id="red-reducer"></div>
+      </div>
+    </div>
+    <div class="widget-note" id="red-note"></div>
+  </div>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>Returning ORM objects from routes</td><td><code>hashed_password</code> in a JSON body, forever, in someone's log aggregator</td><td>Explicit response DTOs</td></tr>
+    <tr><td><code>default=datetime.now()</code></td><td>Every row created at process-boot time</td><td><code>default_factory=lambda: …</code></td></tr>
+    <tr><td>Sequential session ids</td><td>Trivial enumeration of other users' conversations</td><td>UUID string primary keys</td></tr>
+    <tr><td>Password logic in handlers</td><td>One route compares hashes with <code>==</code></td><td>Hashing encapsulated on <code>User</code></td></tr>
+    <tr><td>Unbounded <code>content</code></td><td>A 400k-character message hits the model at full price</td><td><code>max_length=3000</code></td></tr>
+    <tr><td>Missing <code>add_messages</code></td><td>Chat history resets to one message on every turn</td><td>Annotated reducer on state</td></tr>
+    <tr><td>No <code>ON DELETE CASCADE</code></td><td>Deleted users leave orphan sessions and FK errors</td><td>Cascade on <code>session.user_id</code></td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const ROW = {
+  id: 42,
+  email: "ada@example.com",
+  hashed_password: "$2b$12$K1x8Zq7Uu1Yc9V.mQeF3ceO0YhE6bJ0kM8Nn2rTvW4pXsL1aBcDgS",
+  created_at: "2026-07-27T09:14:02.118423+00:00",
+};
+
+function pageInit() {
+  /* ---- DTO leak inspector ---- */
+  const out = document.getElementById("leak-out");
+  const note = document.getElementById("leak-note");
+  function showOrm() {
+    document.getElementById("leak-orm").className = "btn";
+    document.getElementById("leak-dto").className = "btn ghost";
+    out.innerHTML =
+`<span class="dim">GET /api/v1/auth/me  →  200 OK</span>
+
+{
+  "id": 42,
+  "email": "ada@example.com",
+  <span class="bad">"hashed_password": "${ROW.hashed_password}",</span>
+  "created_at": "${ROW.created_at}",
+  <span class="bad">"sessions": [ /* every session this user ever opened */ ]</span>
+}`;
+    note.innerHTML = `<div class="note danger"><span class="note-title">Leaked</span>
+      <p>The bcrypt digest is now in the client's memory, in any proxy log that captures bodies, and in your
+      frontend error-reporting service. bcrypt is slow to crack, but you have permanently widened the blast
+      radius of a stolen log file — and the eager <code>sessions</code> relationship just turned one row read
+      into an unbounded query.</p></div>`;
+  }
+  function showDto() {
+    document.getElementById("leak-orm").className = "btn ghost";
+    document.getElementById("leak-dto").className = "btn";
+    out.innerHTML =
+`<span class="dim">GET /api/v1/auth/me  →  200 OK</span>
+
+{
+  "id": 42,
+  "email": "ada@example.com",
+  "token": {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9…",
+    "token_type": "bearer",
+    "expires_at": "2026-08-26T09:14:02Z"
+  }
+}
+
+<span class="ok">Fields not declared on UserResponse are dropped, not hidden.</span>`;
+    note.innerHTML = `<div class="note ok"><span class="note-title">Contained</span>
+      <p>Pydantic builds the response from the DTO's own fields. Adding a column to the <code>user</code> table
+      tomorrow cannot change this payload — the wire format only moves when someone edits the schema on purpose.</p></div>`;
+  }
+  document.getElementById("leak-orm").addEventListener("click", showOrm);
+  document.getElementById("leak-dto").addEventListener("click", showDto);
+  showDto();
+
+  /* ---- password validator ---- */
+  const RULES = [
+    { name: "min_length=8",      test: p => p.length >= 8,                     msg: "Password must be at least 8 characters long" },
+    { name: "max_length=64",     test: p => p.length <= 64,                    msg: "String should have at most 64 characters" },
+    { name: "[A-Z]",             test: p => /[A-Z]/.test(p),                   msg: "Password must contain at least one uppercase letter" },
+    { name: "[0-9]",             test: p => /[0-9]/.test(p),                   msg: "Password must contain at least one number" },
+    { name: '[!@#$%^&*(),.?":{}|<>]', test: p => /[!@#$%^&*(),.?":{}|<>]/.test(p), msg: "Password must contain at least one special character" },
+  ];
+  function checkPw() {
+    const p = document.getElementById("pw").value;
+    const results = RULES.map(r => ({ ...r, ok: r.test(p) }));
+    const first = results.find(r => !r.ok);
+    const lines = results.map(r =>
+      `  ${r.ok ? '<span class="ok">pass</span>' : '<span class="bad">FAIL</span>'}  ${r.name}`);
+    let body = `<span class="dim">UserCreate(password=SecretStr('${"*".repeat(Math.min(p.length, 24))}'))</span>\n\n` + lines.join("\n") + "\n\n";
+    body += first
+      ? `<span class="bad">ValidationError: ${first.msg}</span>\n<span class="dim">→ FastAPI responds 422 with {"field": "password", "message": "…"}</span>`
+      : `<span class="ok">accepted</span>\n<span class="dim">→ User.hash_password(password) → $2b$12$… stored</span>`;
+    document.getElementById("pw-out").innerHTML = body;
+  }
+  document.getElementById("pw").addEventListener("input", checkPw);
+  checkPw();
+
+  /* ---- reducer comparison ---- */
+  const NODES = [
+    { label: "chat node returns", msg: 'AIMessage("Let me search that")' },
+    { label: "tool node returns", msg: 'ToolMessage("3 results…")' },
+    { label: "chat node returns", msg: 'AIMessage("Here is the answer")' },
+  ];
+  let rstep = 0;
+  function renderRed() {
+    const plain = rstep === 0 ? ['HumanMessage("what is pgvector?")'] : [NODES[rstep - 1].msg];
+    const acc = ['HumanMessage("what is pgvector?")', ...NODES.slice(0, rstep).map(n => n.msg)];
+    const fmtList = (arr, bad) => arr.length
+      ? arr.map(m => `  ${bad ? '<span class="bad">' : ""}${m}${bad ? "</span>" : ""}`).join("\n")
+      : '  <span class="dim">(empty)</span>';
+    document.getElementById("red-plain").innerHTML =
+      `state.messages = [\n${fmtList(plain, rstep > 0)}\n]\n<span class="dim">length ${plain.length}</span>`;
+    document.getElementById("red-reducer").innerHTML =
+      `state.messages = [\n${fmtList(acc, false)}\n]\n<span class="dim">length ${acc.length}</span>`;
+    document.getElementById("red-note").innerHTML = rstep === 0
+      ? "Initial state: the user's message. Press <em>Run next node</em>."
+      : `Node ${rstep} (${NODES[rstep - 1].label}) just returned <code>{"messages": [${NODES[rstep - 1].msg}]}</code>. ` +
+        (rstep >= NODES.length
+          ? "<strong>Left column has lost the entire conversation</strong> — the model would be re-answering with no context, and the tool result it needed is gone."
+          : "Left column overwrote; right column appended.");
+    document.getElementById("red-step").disabled = rstep >= NODES.length;
+  }
+  document.getElementById("red-step").addEventListener("click", () => { rstep = Math.min(rstep + 1, NODES.length); renderRed(); });
+  document.getElementById("red-reset").addEventListener("click", () => { rstep = 0; renderRed(); document.getElementById("red-step").disabled = false; });
+  renderRed();
+}
+</script>
+</body>
+</html>

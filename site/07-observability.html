@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 — Observability · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 07 · Operations</div>
+<h1>Observability &amp; operational wiring</h1>
+<p class="lede">
+  Metrics tell you <em>that</em> something is wrong. Logs tell you <em>which request</em>. Traces tell you
+  <em>where inside the agent</em>. This page builds all three, plus the <code>main.py</code> wiring that puts
+  them in the right order — because middleware order is not a style choice.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  At 10,000 users you cannot read the logs. "Error processing request" tells you nothing: which request, which
+  user, which model, how long had it been running. And nobody will notice p95 latency doubling until it
+  triples and someone complains.
+</p>
+<p>Three signals, three jobs:</p>
+<dl class="kv">
+  <dt>Metrics</dt><dd>Cheap, aggregate, always on. Answers "is it slow, and since when".</dd>
+  <dt>Logs</dt><dd>Per-event, high cardinality. Answers "what happened to user 452 at 10:46:22".</dd>
+  <dt>Traces</dt><dd>Per-run causal tree. Answers "which node in the graph burned six seconds".</dd>
+</dl>
+
+<h2 id="metrics">Defining the metrics</h2>
+<div class="code" data-lang="python" data-file="src/system/telemetry.py">
+<pre>
+from prometheus_client import Counter, Histogram, Gauge
+from starlette_prometheus import metrics, PrometheusMiddleware
+
+# ---- 1. HTTP ----
+http_requests_total = Counter(
+    "http_requests_total", "Total number of HTTP requests",
+    ["method", "endpoint", "status"])          # labels = the dimensions you can slice by
+
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds", "HTTP request duration in seconds",
+    ["method", "endpoint"])                    # default buckets: .005 … 10s
+
+# ---- 2. Infrastructure ----
+db_connections = Gauge("db_connections", "Number of active database connections")
+
+# ---- 3. AI-specific ----
+# LLM calls are seconds, not milliseconds — the default buckets would put
+# nearly every sample in +Inf and make percentiles meaningless.
+llm_inference_duration_seconds = Histogram(
+    "llm_inference_duration_seconds", "Time spent processing LLM inference",
+    ["model"], buckets=[0.1, 0.3, 0.5, 1.0, 2.0, 5.0])
+
+llm_stream_duration_seconds = Histogram(
+    "llm_stream_duration_seconds", "Time spent processing LLM stream inference",
+    ["model"], buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0])
+
+
+def setup_metrics(app):
+    app.add_middleware(PrometheusMiddleware)
+    app.add_route("/metrics", metrics)         # what Prometheus scrapes every 15s
+</pre>
+</div>
+
+<h3>The three metric types, and when each is wrong</h3>
+<table>
+  <thead><tr><th>Type</th><th>Semantics</th><th>Use for</th><th>Gets misused as</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Counter</strong></td><td>Only goes up; resets on restart</td><td>Requests, errors, tokens</td><td>A current value — use <code>rate()</code>, never the raw number</td></tr>
+    <tr><td><strong>Gauge</strong></td><td>Goes up and down</td><td>Pool connections, queue depth</td><td>Anything cumulative</td></tr>
+    <tr><td><strong>Histogram</strong></td><td>Bucketed distribution</td><td>Latency, response size</td><td>An average — the mean hides every user who suffered</td></tr>
+  </tbody>
+</table>
+
+<div class="note warn">
+  <span class="note-title">Label cardinality is the classic way to take Prometheus down</span>
+  <p>Every distinct label combination is a separate time series. <code>endpoint</code> is safe because routes are
+  finite. Adding <code>user_id</code> would create one series per user — at 10,000 users, times method, times
+  status, that is millions of series and an out-of-memory kill. High-cardinality identity belongs in <em>logs</em>
+  and <em>traces</em>, never in metric labels.</p>
+</div>
+
+<div class="note">
+  <span class="note-title">A real gap in this implementation</span>
+  <p><code>db_connections</code> is declared and never set — nothing calls <code>.set()</code> on it, so it
+  reports 0 forever. Given the pool-exhaustion failure mode on <a href="04-service-layer.html">page 04</a>, this
+  is the single most valuable metric to actually wire up: <code>engine.pool.checkedout()</code> on a timer would
+  turn an invisible incident into an obvious one.</p>
+</div>
+
+<h2 id="toy-histogram">Toy example: buckets, percentiles, and the average that lies</h2>
+<p>
+  Prometheus does not store your latency samples — it stores counts per bucket, and
+  <code>histogram_quantile()</code> interpolates <em>within</em> the bucket that contains the target. Bucket
+  choice therefore decides how wrong your p95 is.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Histogram &amp; percentile explorer</span>
+    <span class="widget-tag">histogram_quantile()</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="h-buckets">bucket layout</label>
+        <select id="h-buckets">
+          <option value="llm">LLM: 0.1, 0.3, 0.5, 1, 2, 5</option>
+          <option value="default">Prometheus default: .005 … 10</option>
+          <option value="coarse">too coarse: 1, 10</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="h-tail">slow-tail requests <span class="val" id="h-tail-val"></span></label>
+        <input type="range" id="h-tail" min="0" max="30" value="6" data-suffix="%">
+      </div>
+      <div class="ctrl">
+        <label for="h-base">typical latency <span class="val" id="h-base-val"></span></label>
+        <input type="range" id="h-base" min="100" max="3000" step="100" value="800" data-suffix=" ms">
+      </div>
+      <div class="ctrl">
+        <label>&nbsp;</label>
+        <div class="btn-row"><button class="btn" id="h-resample">Resample 1000 requests</button></div>
+      </div>
+    </div>
+    <div id="h-bars"></div>
+    <div class="stats" style="margin-top:14px">
+      <div class="stat"><div class="k">mean (the lie)</div><div class="v" id="h-mean">—</div></div>
+      <div class="stat"><div class="k">p50 estimated</div><div class="v" id="h-p50">—</div></div>
+      <div class="stat"><div class="k">p95 estimated</div><div class="v warn" id="h-p95">—</div></div>
+      <div class="stat"><div class="k">p95 true</div><div class="v" id="h-p95t">—</div></div>
+      <div class="stat"><div class="k">estimation error</div><div class="v" id="h-err">—</div></div>
+    </div>
+    <div class="widget-note" id="h-note"></div>
+  </div>
+</div>
+
+<h2 id="middleware">Middleware</h2>
+<p>Two classes, one job each: record every request, and make every log line self-describing.</p>
+
+<div class="code" data-lang="python" data-file="src/system/middleware.py">
+<pre>
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Callable) -&gt; Response:
+        start_time = time.time()
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception:
+            status_code = 500        # record the crash, then let it propagate
+            raise
+        finally:
+            # finally: runs on success, on HTTPException, and on crash.
+            # Without it your metrics would only describe your happy path.
+            duration = time.time() - start_time
+            if request.url.path not in ["/metrics", "/health"]:   # drop the noise
+                http_requests_total.labels(
+                    method=request.method, endpoint=request.url.path,
+                    status=status_code).inc()
+                http_request_duration_seconds.labels(
+                    method=request.method, endpoint=request.url.path).observe(duration)
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="src/system/middleware.py">
+<pre>
+class LoggingContextMiddleware(BaseHTTPMiddleware):
+    """Extract identity BEFORE the router, so auth failures are attributable too."""
+
+    async def dispatch(self, request: Request, call_next: Callable) -&gt; Response:
+        try:
+            # 1. Context lives in a ContextVar. Workers are reused across
+            #    requests, so a stale value would leak into someone else's logs.
+            clear_context()
+
+            # 2. Peek at the token WITHOUT verifying it. This value is used
+            #    only to tag logs — never to authorise anything.
+            auth_header = request.headers.get("authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+                try:
+                    payload = jwt.get_unverified_claims(token)
+                    if payload.get("sub"):
+                        bind_context(subject_id=payload.get("sub"))
+                except JWTError:
+                    pass          # malformed tokens are the router's problem
+
+            response = await call_next(request)
+
+            if hasattr(request.state, "user_id"):
+                bind_context(user_id=request.state.user_id)
+            return response
+        finally:
+            clear_context()       # symmetric cleanup, always
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Why an unverified decode is acceptable here — and only here</span>
+  <p>A forged token can put any <code>sub</code> it likes into your logs. That is a log-poisoning nuisance, not
+  a privilege escalation, because nothing downstream trusts this value: the auth dependency on
+  <a href="06-api-gateway.html">page 06</a> verifies independently. The payoff is that a 401 still tells you
+  <em>who</em> tried. Never reuse this pattern for a decision.</p>
+</div>
+
+<h2 id="toy-onion">Toy example: middleware ordering</h2>
+<p>
+  Middleware wraps like an onion — first added is outermost, so it sees the request first and the response
+  last. Drag the order and watch what breaks.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Middleware onion</span>
+    <span class="widget-tag">order matters</span>
+  </div>
+  <div class="widget-body">
+    <div class="btn-row" style="margin-bottom:14px">
+      <button class="btn" id="o-correct">Correct order</button>
+      <button class="btn ghost" id="o-swap">Swap logging ↔ metrics</button>
+      <button class="btn ghost" id="o-cors">Put CORS outermost</button>
+    </div>
+    <div class="out" id="o-out"></div>
+    <div id="o-note" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<h2 id="logs">Structured logging</h2>
+<p>
+  <code>structlog</code> emits key-value events instead of prose. In development they render as readable
+  console lines; in production they are JSON that a log aggregator can index and query.
+</p>
+
+<div class="code" data-lang="python" data-file="src/system/logs.py">
+<pre>
+from contextvars import ContextVar
+
+# ContextVar, not a global: each async task gets its own view, so two
+# concurrent requests can never see each other's context.
+_request_context: ContextVar[Dict[str, Any]] = ContextVar("request_context", default={})
+
+
+def bind_context(**kwargs: Any) -&gt; None:
+    current = _request_context.get()
+    _request_context.set({**current, **kwargs})     # merge, never replace
+
+
+def clear_context() -&gt; None:
+    _request_context.set({})
+
+
+def add_context_to_event_dict(logger, method_name, event_dict):
+    """structlog processor: injects the bound context into every event."""
+    event_dict.update(_request_context.get())
+    return event_dict
+</pre>
+</div>
+
+<p>The call site stays trivial — the context arrives on its own:</p>
+
+<div class="code" data-lang="python" data-file="anywhere in the request path">
+<pre>
+logger.info("llm_response_generated", model=model_name, session_id=session_id)
+
+# development (LOG_FORMAT=console)
+# 2026-07-27 11:42:08 [info   ] llm_response_generated
+#     model=gpt-5-mini session_id=8f3c… user_id=42 subject_id=8f3c…
+
+# production (LOG_FORMAT=json)
+# {"event":"llm_response_generated","level":"info","model":"gpt-5-mini",
+#  "session_id":"8f3c…","user_id":42,"subject_id":"8f3c…",
+#  "timestamp":"2026-07-27T11:42:08.117Z"}
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Event names are identifiers, not sentences</span>
+  <p><code>"llm_response_generated"</code> rather than <code>f"Generated response for {user}"</code>. Stable
+  snake_case names are groupable — <code>count by (event)</code> works, alerts can key off them, and the
+  variable parts stay in fields where they are queryable. Interpolating values into the message is what makes
+  logs unsearchable at volume.</p>
+</div>
+
+<h2 id="toy-logs">Toy example: the same event, three ways</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Log formatter</span>
+    <span class="widget-tag">structlog</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="l-style">logging style</label>
+        <select id="l-style">
+          <option value="naive">naive f-string logging</option>
+          <option value="console">structlog · console (dev)</option>
+          <option value="json">structlog · json (prod)</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="l-ctx">request context bound</label>
+        <select id="l-ctx"><option value="1">yes</option><option value="0">no</option></select>
+      </div>
+    </div>
+    <div class="out" id="l-out"></div>
+    <div class="widget-note" id="l-note"></div>
+  </div>
+</div>
+
+<h2 id="main">Wiring it all: <code>src/main.py</code></h2>
+<p>
+  The entry point does no business logic. It manages lifecycle, assembles the middleware stack, normalises
+  errors, and mounts the router.
+</p>
+
+<div class="code" data-lang="python" data-file="src/main.py">
+<pre>
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown in one function.
+
+    Replaces @app.on_event, and — unlike it — guarantees the shutdown half
+    runs even if startup raised partway through.
+    """
+    logger.info("application_startup",
+                project_name=settings.PROJECT_NAME, version=settings.VERSION,
+                api_prefix=settings.API_V1_STR, environment=settings.ENVIRONMENT.value)
+
+    yield                       # the application serves traffic here
+
+    logger.info("application_shutdown")
+    langfuse.flush()            # Langfuse buffers spans; without this the
+                                # last few seconds of traces are lost on deploy
+
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan,
+)
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="src/main.py">
+<pre>
+# ORDER IS SEMANTIC. First added = outermost = sees the request first.
+setup_metrics(app)                          # 1. PrometheusMiddleware + /metrics
+app.add_middleware(LoggingContextMiddleware)# 2. bind context before anything logs
+app.add_middleware(MetricsMiddleware)       # 3. time the inner stack
+app.add_middleware(                         # 4. CORS closest to the router
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate limiting needs both halves or the decorator raises instead of 429ing
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title"><code>allow_credentials=True</code> with a wildcard origin does not work</span>
+  <p><code>ALLOWED_ORIGINS</code> defaults to <code>["*"]</code>. Browsers refuse credentialed requests against a
+  wildcard <code>Access-Control-Allow-Origin</code> — the spec forbids it — so the combination silently breaks
+  cookie-based clients while looking permissive. List real origins per environment.</p>
+</div>
+
+<h3>Uniform validation errors</h3>
+<div class="code" data-lang="python" data-file="src/main.py">
+<pre>
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # warning, not error: a 422 is the client's mistake, and paging
+    # someone for it will teach them to ignore the pager.
+    logger.warning("validation_error", path=request.url.path, errors=str(exc.errors()))
+
+    formatted_errors = []
+    for error in exc.errors():
+        # ["body", "messages", 0, "content"] -> "messages -&gt; 0 -&gt; content"
+        loc = " -&gt; ".join([str(p) for p in error["loc"] if p != "body"])
+        formatted_errors.append({"field": loc, "message": error["msg"]})
+
+    return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        content={"detail": "Validation error", "errors": formatted_errors})
+</pre>
+</div>
+
+<h3>Health check that means something</h3>
+<div class="code" data-lang="python" data-file="src/main.py">
+<pre>
+@app.get("/health")
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["health"][0])
+async def health_check(request: Request) -&gt; Dict[str, Any]:
+    # A health check that only proves the process is alive is theatre.
+    # This one actually round-trips the database.
+    db_healthy = await database_service.health_check()
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK if db_healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "status": "healthy" if db_healthy else "degraded",
+            "components": {"api": "healthy",
+                           "database": "healthy" if db_healthy else "unhealthy"},
+            "timestamp": datetime.now().isoformat(),
+        })
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Liveness vs readiness</span>
+  <p>This endpoint conflates them. Under Kubernetes, a dependency check on the <em>liveness</em> probe means a
+  brief database blip restarts every pod at once — turning a recoverable incident into an outage. The usual
+  split: liveness = "the process responds" (the cheap <code>/api/v1/health</code> in the router), readiness =
+  "it can serve traffic" (this one, which gates the load balancer without killing anything).</p>
+</div>
+
+<h2 id="tracing">Tracing with Langfuse</h2>
+<p>
+  Metrics and logs stop at the HTTP boundary. Inside one request the agent may make three LLM calls, two tool
+  calls and a vector search — a tree, not a line. The Langfuse callback records that tree, with per-span
+  latency, token counts and cost.
+</p>
+
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+config = {
+    "configurable": {"thread_id": session_id},
+    "callbacks": [CallbackHandler(environment=settings.ENVIRONMENT.value,
+                                  user_id=user_id, session_id=session_id)],
+    "metadata": {"user_id": user_id, "session_id": session_id,
+                 "environment": settings.ENVIRONMENT.value, "debug": settings.DEBUG},
+}
+</pre>
+</div>
+
+<p>
+  Those traces are not just for debugging — they are the input to the evaluation framework in
+  <a href="09-evaluation.html">layer 09</a>, which replays them through an LLM judge and writes scores back.
+</p>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>No metrics</td><td>You learn about the outage from a customer</td><td>Counters + histograms scraped every 15s</td></tr>
+    <tr><td>Timing outside <code>finally</code></td><td>Failed requests vanish from your latency data</td><td><code>try/finally</code> in the middleware</td></tr>
+    <tr><td>Default buckets on LLM latency</td><td>Every sample in <code>+Inf</code>; p95 is a guess</td><td>Custom buckets sized to seconds</td></tr>
+    <tr><td><code>user_id</code> as a metric label</td><td>Prometheus OOMs on series explosion</td><td>Identity in logs, not labels</td></tr>
+    <tr><td>Unstructured logs</td><td>grep across 40M lines during an incident</td><td>structlog events + JSON in prod</td></tr>
+    <tr><td>Context not cleared</td><td>User 42's id attached to user 91's error</td><td><code>clear_context()</code> in <code>finally</code></td></tr>
+    <tr><td>Wrong middleware order</td><td>Auth failures logged with no identity</td><td>LoggingContext outermost</td></tr>
+    <tr><td>No <code>langfuse.flush()</code></td><td>Every deploy silently drops the last traces</td><td>Flush in the lifespan shutdown</td></tr>
+    <tr><td>Trivial health check</td><td>LB keeps routing to a pod with a dead database</td><td>Health check that queries the DB</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const BUCKETS = {
+  llm: [0.1, 0.3, 0.5, 1.0, 2.0, 5.0],
+  default: [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0],
+  coarse: [1.0, 10.0],
+};
+
+function pageInit() {
+  /* ============ histogram ============ */
+  let samples = [];
+  function sample() {
+    const tailPct = Number(document.getElementById("h-tail").value) / 100;
+    const base = Number(document.getElementById("h-base").value) / 1000;
+    samples = [];
+    for (let i = 0; i < 1000; i++) {
+      if (Math.random() < tailPct) samples.push(base * (3 + Math.random() * 9));      // slow tail
+      else samples.push(base * (0.55 + Math.random() * 0.9));
+    }
+    hRender();
+  }
+  function quantile(sorted, q) {
+    const i = (sorted.length - 1) * q;
+    const lo = Math.floor(i), hi = Math.ceil(i);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo);
+  }
+  function histQuantile(buckets, counts, total, q) {
+    const target = q * total;
+    let prevCount = 0, prevBound = 0;
+    for (let i = 0; i < buckets.length; i++) {
+      if (counts[i] >= target) {
+        // linear interpolation inside the bucket — exactly what Prometheus does
+        const frac = (target - prevCount) / (counts[i] - prevCount || 1);
+        return prevBound + (buckets[i] - prevBound) * frac;
+      }
+      prevCount = counts[i]; prevBound = buckets[i];
+    }
+    return Infinity;      // fell into +Inf: unbounded, unknowable
+  }
+  function hRender() {
+    const key = document.getElementById("h-buckets").value;
+    const buckets = BUCKETS[key];
+    const counts = buckets.map(b => samples.filter(s => s <= b).length);   // cumulative, le
+    const total = samples.length;
+    const sorted = [...samples].sort((a, b) => a - b);
+
+    let html = "";
+    let prev = 0;
+    buckets.forEach((b, i) => {
+      const inBucket = counts[i] - prev; prev = counts[i];
+      html += bar(`le ${b}s`, inBucket, total * 0.6);
+    });
+    const inf = total - counts[counts.length - 1];
+    html += bar("+Inf", inf, total * 0.6, inf > total * 0.05 ? "var(--danger)" : undefined);
+    document.getElementById("h-bars").innerHTML = html;
+
+    const mean = samples.reduce((a, b) => a + b, 0) / total;
+    const p50 = histQuantile(buckets, counts, total, 0.5);
+    const p95 = histQuantile(buckets, counts, total, 0.95);
+    const p95t = quantile(sorted, 0.95);
+    const err = isFinite(p95) ? Math.abs(p95 - p95t) / p95t * 100 : Infinity;
+
+    document.getElementById("h-mean").textContent = mean.toFixed(2) + "s";
+    document.getElementById("h-p50").textContent = isFinite(p50) ? p50.toFixed(2) + "s" : "+Inf";
+    document.getElementById("h-p95").textContent = isFinite(p95) ? p95.toFixed(2) + "s" : "+Inf";
+    document.getElementById("h-p95t").textContent = p95t.toFixed(2) + "s";
+    const errEl = document.getElementById("h-err");
+    errEl.textContent = isFinite(err) ? err.toFixed(0) + "%" : "unbounded";
+    errEl.className = "v " + (!isFinite(err) || err > 25 ? "bad" : err > 10 ? "warn" : "good");
+
+    const notes = [];
+    notes.push(`Mean is <strong>${mean.toFixed(2)}s</strong> but p95 is <strong>${p95t.toFixed(2)}s</strong> — the average describes a user who does not exist.`);
+    if (!isFinite(p95)) notes.push(`<span style="color:var(--danger)"><strong>p95 lands in +Inf.</strong> ${inf} of ${total} samples exceeded the largest bucket, so Prometheus cannot estimate the quantile at all. Your dashboard will show a flat, wrong number and you will trust it.</span>`);
+    else if (err > 25) notes.push(`<span style="color:var(--warn)">Estimation error is <strong>${err.toFixed(0)}%</strong> — the buckets are too coarse around the p95, so interpolation is guessing across a wide gap.</span>`);
+    else notes.push(`Estimation error <strong>${err.toFixed(0)}%</strong>: the buckets straddle the p95 closely enough that interpolation is trustworthy.`);
+    notes.push("Buckets are cumulative (<code>le</code> = less-or-equal); the bars above show per-bucket counts for readability.");
+    document.getElementById("h-note").innerHTML = notes.join(" ");
+  }
+  bindRange("h-tail", sample);
+  bindRange("h-base", sample);
+  document.getElementById("h-buckets").addEventListener("change", hRender);
+  document.getElementById("h-resample").addEventListener("click", sample);
+  sample();
+
+  /* ============ middleware onion ============ */
+  const ORDERS = {
+    correct: {
+      stack: ["LoggingContextMiddleware", "MetricsMiddleware", "CORSMiddleware", "router → handler"],
+      good: true,
+      note: ["ok", "Correct", "Logging is outermost, so context is bound before anything downstream can emit a line — including a 401 raised by the auth dependency. Metrics sits inside it, timing everything except the context bookkeeping. CORS is innermost because it only needs to decorate the response headers."] },
+    swap: {
+      stack: ["MetricsMiddleware", "LoggingContextMiddleware", "CORSMiddleware", "router → handler"],
+      good: false,
+      note: ["warn", "Survivable, but you lose attribution", "Metrics still work — they don't need context. But any log line emitted by the metrics layer itself (a timing warning, an unhandled exception caught on the way out) now has no <code>subject_id</code>. The requests you most want to attribute are exactly the ones that fail in the outer layers."] },
+    cors: {
+      stack: ["CORSMiddleware", "LoggingContextMiddleware", "MetricsMiddleware", "router → handler"],
+      good: false,
+      note: ["warn", "Preflights vanish from your data", "CORS answers <code>OPTIONS</code> preflights itself and returns immediately, never calling the inner stack. Those requests are now invisible to both metrics and logs. A browser client generates one preflight per unique request shape — that can be a third of your traffic silently missing from the dashboard."] },
+  };
+  function renderOnion(key) {
+    const o = ORDERS[key];
+    const lines = [];
+    lines.push('<span class="dim">request →</span>');
+    o.stack.forEach((m, i) => lines.push(`${"  ".repeat(i + 1)}<span class="hl">┌─ ${m}</span>`));
+    lines.push(`${"  ".repeat(o.stack.length + 1)}<span class="ok">● response generated</span>`);
+    for (let i = o.stack.length - 1; i >= 0; i--) lines.push(`${"  ".repeat(i + 1)}<span class="dim">└─ ${o.stack[i]}</span>`);
+    lines.push('<span class="dim">← response</span>');
+    document.getElementById("o-out").innerHTML = lines.join("\n");
+    document.getElementById("o-note").innerHTML =
+      `<div class="note ${o.note[0]}"><span class="note-title">${o.note[1]}</span><p>${o.note[2]}</p></div>`;
+  }
+  document.getElementById("o-correct").addEventListener("click", () => renderOnion("correct"));
+  document.getElementById("o-swap").addEventListener("click", () => renderOnion("swap"));
+  document.getElementById("o-cors").addEventListener("click", () => renderOnion("cors"));
+  renderOnion("correct");
+
+  /* ============ log formatter ============ */
+  function renderLogs() {
+    const style = document.getElementById("l-style").value;
+    const ctx = document.getElementById("l-ctx").value === "1";
+    const c = ctx ? { user_id: 452, session_id: "8f3c1d20", subject_id: "8f3c1d20" } : {};
+    let out, note;
+    if (style === "naive") {
+      out = `INFO:root:Generated response for user using gpt-5-mini
+INFO:root:Generated response for user using gpt-5-mini
+ERROR:root:Error processing request
+INFO:root:Generated response for user using gpt-5-mini`;
+      note = "Four lines, no identity, no timing, no way to correlate the error with the request that caused it. At 200 requests/second this file is unusable within minutes — and the one detail you need (<em>which</em> user, <em>which</em> session) was never written down.";
+    } else if (style === "console") {
+      out = `2026-07-27 11:42:08 [<span class="ok">info    </span>] llm_response_generated  <span class="hl">model</span>=gpt-5-mini${ctx ? ` <span class="hl">session_id</span>=${c.session_id} <span class="hl">user_id</span>=${c.user_id}` : ""}
+2026-07-27 11:42:09 [<span class="warnc">warning </span>] switching_model_fallback  <span class="hl">old_index</span>=0 <span class="hl">new_model</span>=gpt-5${ctx ? ` <span class="hl">user_id</span>=${c.user_id}` : ""}
+2026-07-27 11:42:14 [<span class="bad">error   </span>] chat_request_failed  <span class="hl">error</span>='timeout'${ctx ? ` <span class="hl">session_id</span>=${c.session_id} <span class="hl">user_id</span>=${c.user_id}` : ""}`;
+      note = ctx
+        ? "Aligned and colourised for a human at a terminal. The context fields were never passed at the call site — <code>add_context_to_event_dict</code> merged them in from the ContextVar."
+        : "<strong>Context not bound.</strong> The events are still structured, but you cannot tell which user hit the timeout. This is what happens when <code>LoggingContextMiddleware</code> sits too deep in the stack — or when someone calls <code>clear_context()</code> too early.";
+    } else {
+      out = `{"event":"llm_response_generated","level":"info","model":"gpt-5-mini"${ctx ? `,"session_id":"${c.session_id}","user_id":${c.user_id},"subject_id":"${c.subject_id}"` : ""},"timestamp":"2026-07-27T11:42:08.117Z"}
+{"event":"switching_model_fallback","level":"warning","old_index":0,"new_model":"gpt-5"${ctx ? `,"user_id":${c.user_id}` : ""},"timestamp":"2026-07-27T11:42:09.884Z"}
+{"event":"chat_request_failed","level":"error","error":"timeout"${ctx ? `,"session_id":"${c.session_id}","user_id":${c.user_id}` : ""},"timestamp":"2026-07-27T11:42:14.002Z"}`;
+      note = "One JSON object per line. Now <code>event:\"switching_model_fallback\"</code> is a queryable field — you can chart provider fallbacks over time, alert when the rate jumps, and pivot straight to <code>user_id:452</code> to see everything that user experienced.";
+    }
+    document.getElementById("l-out").innerHTML = out;
+    document.getElementById("l-note").innerHTML = note;
+  }
+  document.getElementById("l-style").addEventListener("change", renderLogs);
+  document.getElementById("l-ctx").addEventListener("change", renderLogs);
+  renderLogs();
+}
+</script>
+</body>
+</html>

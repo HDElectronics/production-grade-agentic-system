@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 — Modular codebase · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 01 · Foundations</div>
+<h1>Modular codebase</h1>
+<p class="lede">
+  Dependencies, environment-aware settings and container topology. This is the least glamorous layer and
+  the one that decides whether the next nine are survivable — every later page imports <code>settings</code>
+  and assumes a service is reachable by name.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  Python projects start as one file and rot into a ball of mud. In an agentic system the rot is expensive
+  in a specific way: config values (model name, temperature, pool size, rate limits) end up hard-coded in
+  a dozen places, so "turn the temperature down in production" becomes a code change, a review, and a deploy
+  instead of an environment variable.
+</p>
+<p>Three rules carry this layer:</p>
+<ul>
+  <li><strong>One module, one concern.</strong> API routing does not know how the LLM is called; the LLM service does not know a request exists.</li>
+  <li><strong>Config is data, not code.</strong> Everything that differs between laptop and production is read from the environment.</li>
+  <li><strong>The environment is reproducible.</strong> If the database only exists on your machine, you don't have a system, you have a demo.</li>
+</ul>
+
+<h2 id="layout">Directory layout</h2>
+<p>The write-up presents the canonical layout under <code>app/</code>:</p>
+
+<div class="code" data-lang="bash" data-file="canonical layout">
+<pre>
+├── app/                         # Main application source code
+│   ├── api/                     # API route handlers
+│   │   └── v1/                  # Versioned API (v1 endpoints)
+│   ├── core/                    # Core config & cross-cutting logic
+│   │   ├── langgraph/           # Agent / LangGraph logic
+│   │   │   └── tools/           # Agent tools (search, actions, …)
+│   │   └── prompts/             # System & agent prompts
+│   ├── models/                  # Database models (SQLModel)
+│   ├── schemas/                 # Validation schemas (Pydantic)
+│   ├── services/                # Business logic layer
+│   └── utils/                   # Shared helpers
+├── evals/                       # AI evaluation framework
+│   └── metrics/prompts/         # LLM-as-a-judge rubrics
+├── grafana/dashboards/json/     # Dashboards as code
+├── prometheus/                  # Scrape configuration
+├── scripts/                     # DevOps automation
+└── .github/workflows/           # CI/CD
+</pre>
+</div>
+
+<p>The shipped code in this repository uses the same architecture with more descriptive names:</p>
+
+<div class="code" data-lang="bash" data-file="this repository">
+<pre>
+src/
+├── main.py                   # FastAPI app: lifespan, middleware, exception handlers
+├── config/settings.py        # Environment-aware settings object
+├── interface/                # HTTP layer  (auth.py, interaction.py, router.py)
+├── agent/                    # LangGraph agent (workflow.py, tools/, prompts/)
+├── services/llm_provider.py  # Retry + circular fallback around the LLM
+├── data/                     # db_manager.py, models/, schemas/
+├── system/                   # logs.py, telemetry.py, middleware.py, rate_limit.py
+└── utils/                    # auth.py, sanitization.py, graph.py
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Why the split matters later</span>
+  <p><code>src/system/</code> holds everything that wraps <em>every</em> request (logging, metrics, limits).
+  <code>src/services/</code> holds things a route calls <em>on purpose</em>. Keeping those apart is what lets
+  <a href="07-observability.html">layer 07</a> add observability without touching a single route handler.</p>
+</div>
+
+<h2 id="deps">Dependency management</h2>
+<p>
+  <code>requirements.txt</code> gives you a flat list with no metadata, no dependency groups and no tool
+  configuration. <code>pyproject.toml</code> (PEP 621) gives you all three in one file, which matters when the
+  formatter, the linter, the test runner and the packaging metadata all need to agree.
+</p>
+
+<div class="code" data-lang="python" data-file="pyproject.toml — metadata">
+<pre>
+[project]
+name = "My Agentic AI System"
+version = "0.1.0"
+description = "Deploying it as a SaaS"
+readme = "README.md"
+requires-python = "&gt;=3.13"
+</pre>
+</div>
+
+<p>The runtime dependencies are grouped by the job they do — which is itself documentation:</p>
+
+<div class="code" data-lang="python" data-file="pyproject.toml — runtime deps">
+<pre>
+dependencies = [
+    # --- Web framework & server ---
+    "fastapi&gt;=0.121.0",         # async web framework
+    "uvicorn&gt;=0.34.0",          # ASGI server
+    "uvloop&gt;=0.22.1",           # faster event loop
+
+    # --- LangChain / LangGraph ecosystem ---
+    "langchain&gt;=1.0.5",
+    "langgraph&gt;=1.0.2",                     # graph-based agent workflows
+    "langgraph-checkpoint-postgres&gt;=3.0.1", # durable graph state
+
+    # --- Observability ---
+    "langfuse==3.9.1",          # LLM tracing (pinned exactly: SDK churns)
+    "structlog&gt;=25.2.0",        # structured logging
+
+    # --- Auth & security ---
+    "passlib[bcrypt]&gt;=1.7.4",
+    "python-jose[cryptography]&gt;=3.4.0",
+
+    # --- Database ---
+    "psycopg2-binary&gt;=2.9.10",
+    "sqlmodel&gt;=0.0.24",         # SQLAlchemy + Pydantic
+
+    # --- Reliability ---
+    "tenacity&gt;=9.1.2",          # retries with exponential backoff
+    "slowapi&gt;=0.1.9",           # rate limiting
+
+    # --- Memory ---
+    "mem0ai&gt;=1.0.0",            # long-term memory over pgvector
+]
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Read the version operators carefully</span>
+  <p>Almost everything uses <code>&gt;=</code>, but <code>langfuse==3.9.1</code> is pinned exactly. That asymmetry is
+  deliberate: floors keep you patchable, exact pins are for libraries whose minor releases break you. The lockfile
+  (<code>uv.lock</code>) is what actually makes builds reproducible — the ranges here only describe what is
+  <em>acceptable</em>.</p>
+</div>
+
+<p>Development and test dependencies stay out of the production image:</p>
+
+<div class="code" data-lang="python" data-file="pyproject.toml — groups & tooling">
+<pre>
+[project.optional-dependencies]
+dev = ["black", "isort", "flake8", "ruff", "djlint==1.36.4"]
+
+[dependency-groups]                 # PEP 735 style
+test = ["httpx&gt;=0.28.1", "pytest&gt;=8.3.5"]
+
+[tool.black]
+line-length = 119
+exclude = "venv|migrations"
+
+[tool.isort]
+profile = "black"                   # so isort and black stop fighting
+line_length = 119
+
+[tool.ruff]
+line-length = 119
+exclude = ["migrations", "*.ipynb", "venv"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]            # re-export modules may import late
+
+radon-max-cc = 10                   # cyclomatic complexity ceiling
+</pre>
+</div>
+
+<h2 id="settings">Environment configuration</h2>
+<p>
+  A single <code>.env</code> forces you to edit the file every time you switch context. The pattern here is one
+  file per environment — <code>.env.development</code>, <code>.env.staging</code>, <code>.env.production</code> —
+  with <code>.env.example</code> committed as the documented template, and the real files gitignored.
+</p>
+
+<div class="code" data-lang="bash" data-file=".env.example (excerpt)">
+<pre>
+APP_ENV=development                 # development | staging | production | test
+PROJECT_NAME="Project Name"
+DEBUG=true
+API_V1_STR=/api/v1
+ALLOWED_ORIGINS="http://localhost:3000,http://localhost:8000"
+
+OPENAI_API_KEY="your-llm-api-key"
+DEFAULT_LLM_MODEL=gpt-4o-mini
+DEFAULT_LLM_TEMPERATURE=0.2
+
+JWT_SECRET_KEY="your-jwt-secret-key"
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_DAYS=30
+
+POSTGRES_HOST=db                    # the docker-compose service name
+POSTGRES_POOL_SIZE=5                # persistent connections
+POSTGRES_MAX_OVERFLOW=10            # burst headroom above the pool
+
+RATE_LIMIT_DEFAULT="1000 per day,200 per hour"
+RATE_LIMIT_CHAT="100 per minute"
+LOG_LEVEL=DEBUG
+LOG_FORMAT=console                  # console | json
+</pre>
+</div>
+
+<h3>Resolving which file wins</h3>
+<p>
+  <code>src/config/settings.py</code> decides the environment first, then walks a priority list and loads the
+  <em>first</em> file that exists. Local overrides beat committed defaults, and nothing needs a command-line flag.
+</p>
+
+<div class="code" data-lang="python" data-file="src/config/settings.py">
+<pre>
+class Environment(str, Enum):
+    DEVELOPMENT = "development"
+    STAGING     = "staging"
+    PRODUCTION  = "production"
+    TEST        = "test"
+
+
+def get_environment() -&gt; Environment:
+    match os.getenv("APP_ENV", "development").lower():
+        case "production" | "prod": return Environment.PRODUCTION
+        case "staging"    | "stage": return Environment.STAGING
+        case "test":                 return Environment.TEST
+        case _:                      return Environment.DEVELOPMENT
+
+
+def load_env_file():
+    """Load the highest-priority .env file that exists."""
+    env = get_environment()
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+    env_files = [
+        os.path.join(base_dir, f".env.{env.value}.local"),  # personal, gitignored
+        os.path.join(base_dir, f".env.{env.value}"),        # per-environment
+        os.path.join(base_dir, ".env.local"),               # local catch-all
+        os.path.join(base_dir, ".env"),                     # last resort
+    ]
+    for env_file in env_files:
+        if os.path.isfile(env_file):
+            load_dotenv(dotenv_path=env_file)
+            return env_file
+    return None
+
+
+ENV_FILE = load_env_file()          # runs at import time
+</pre>
+</div>
+
+<h3>Parsing structured values out of flat strings</h3>
+<p>
+  Environment variables are strings. Lists and per-endpoint maps need helpers, and those helpers need to be
+  forgiving about quoting because <code>.env</code> files are edited by humans and by shell scripts.
+</p>
+
+<div class="code" data-lang="python" data-file="src/config/settings.py">
+<pre>
+def parse_list_from_env(env_key, default=None):
+    """ALLOWED_ORIGINS="a,b" -&gt; ["a", "b"]"""
+    value = os.getenv(env_key)
+    if not value:
+        return default or []
+    value = value.strip("\"'")               # tolerate quoted values
+    if "," not in value:
+        return [value]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_dict_of_lists_from_env(prefix, default_dict=None):
+    """RATE_LIMIT_CHAT="100 per minute" -&gt; {"chat": ["100 per minute"]}"""
+    result = default_dict or {}
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            endpoint = key[len(prefix):].lower()
+            if value:
+                value = value.strip("\"'")
+                result[endpoint] = ([item.strip() for item in value.split(",") if item.strip()]
+                                    if "," in value else [value])
+    return result
+</pre>
+</div>
+
+<h3>The safety net: environment overrides</h3>
+<p>
+  This is the most important twenty lines in the file. Whatever the <code>.env</code> says, production
+  <em>forces</em> debug off, logs to JSON, and tightens the default rate limits. A misconfigured deploy
+  degrades into a safe configuration rather than a leaky one.
+</p>
+
+<div class="code" data-lang="python" data-file="src/config/settings.py">
+<pre>
+class Settings:
+    def __init__(self):
+        self.ENVIRONMENT = get_environment()
+
+        self.PROJECT_NAME = os.getenv("PROJECT_NAME", "FastAPI LangGraph Agent")
+        self.API_V1_STR   = os.getenv("API_V1_STR", "/api/v1")
+        self.DEBUG        = os.getenv("DEBUG", "false").lower() in ("true", "1", "t", "yes")
+        self.ALLOWED_ORIGINS = parse_list_from_env("ALLOWED_ORIGINS", ["*"])
+
+        self.DEFAULT_LLM_MODEL       = os.getenv("DEFAULT_LLM_MODEL", "gpt-4o-mini")
+        self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
+        self.MAX_TOKENS              = int(os.getenv("MAX_TOKENS", "2000"))
+        self.MAX_LLM_CALL_RETRIES    = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
+
+        self.POSTGRES_POOL_SIZE    = int(os.getenv("POSTGRES_POOL_SIZE", "20"))
+        self.POSTGRES_MAX_OVERFLOW = int(os.getenv("POSTGRES_MAX_OVERFLOW", "10"))
+        # Tables LangGraph's Postgres checkpointer owns
+        self.CHECKPOINT_TABLES = ["checkpoint_blobs", "checkpoint_writes", "checkpoints"]
+
+        self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "unsafe-secret-for-dev")
+        self.RATE_LIMIT_DEFAULT = parse_list_from_env(
+            "RATE_LIMIT_DEFAULT", ["200 per day", "50 per hour"])
+        self.RATE_LIMIT_ENDPOINTS = {
+            "chat":        parse_list_from_env("RATE_LIMIT_CHAT",        ["30 per minute"]),
+            "chat_stream": parse_list_from_env("RATE_LIMIT_CHAT_STREAM", ["20 per minute"]),
+            "auth":        parse_list_from_env("RATE_LIMIT_LOGIN",       ["20 per minute"]),
+            "root":        parse_list_from_env("RATE_LIMIT_ROOT",        ["10 per minute"]),
+            "health":      parse_list_from_env("RATE_LIMIT_HEALTH",      ["20 per minute"]),
+        }
+
+        self.apply_environment_settings()
+
+    def apply_environment_settings(self):
+        """Rigorous overrides. Production stays safe even if .env is wrong."""
+        if self.ENVIRONMENT == Environment.DEVELOPMENT:
+            self.DEBUG      = True
+            self.LOG_LEVEL  = "DEBUG"
+            self.LOG_FORMAT = "console"
+            self.RATE_LIMIT_DEFAULT = ["1000 per day", "200 per hour"]
+
+        elif self.ENVIRONMENT == Environment.PRODUCTION:
+            self.DEBUG      = False          # never leak tracebacks
+            self.LOG_LEVEL  = "WARNING"
+            self.LOG_FORMAT = "json"         # machine-parseable
+            self.RATE_LIMIT_DEFAULT = ["200 per day", "50 per hour"]
+
+
+settings = Settings()                        # single global instance
+</pre>
+</div>
+
+<h2 id="toy-settings">Toy example: resolve the settings yourself</h2>
+<p>
+  Pick an environment and a set of <code>.env</code> files that exist on disk, then optionally try to sabotage
+  it. The panel below runs the same resolution order and the same override rules as the code above.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Settings resolver</span>
+    <span class="widget-tag">simulation</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="env-select">APP_ENV</label>
+        <select id="env-select">
+          <option value="development">development</option>
+          <option value="prod">prod  (alias)</option>
+          <option value="production">production</option>
+          <option value="staging">staging</option>
+          <option value="test">test</option>
+          <option value="banana">banana  (typo)</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label>Files present on disk</label>
+        <div style="display:flex;flex-direction:column;gap:2px;font-size:12.5px" class="mono" id="file-boxes"></div>
+      </div>
+      <div class="ctrl">
+        <label>.env contents</label>
+        <div style="display:flex;flex-direction:column;gap:2px;font-size:12.5px" class="mono">
+          <label><input type="checkbox" id="opt-debug" checked> DEBUG=true</label>
+          <label><input type="checkbox" id="opt-json"> LOG_FORMAT=json</label>
+          <label><input type="checkbox" id="opt-loose" checked> RATE_LIMIT_DEFAULT="5000 per day"</label>
+        </div>
+      </div>
+    </div>
+    <div class="out" id="settings-out"></div>
+    <div class="widget-note">
+      Try <code>APP_ENV=production</code> with <code>DEBUG=true</code> checked — the override silently wins.
+      Try <code>banana</code> — unknown values fall through to development rather than crashing, which is the
+      right call for a value that might come from a shell typo.
+    </div>
+  </div>
+</div>
+
+<h2 id="containers">Containerisation strategy</h2>
+<p>
+  The agent needs a vector store, metrics collection, dashboards and container-level resource stats. Running
+  those by hand is not reproducible, so the whole topology is declared in <code>docker-compose.yml</code>.
+</p>
+
+<div class="code" data-lang="yaml" data-file="docker-compose.yml — database">
+<pre>
+services:
+  db:
+    image: pgvector/pgvector:pg16      # NOT plain postgres: we need vectors
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports: ["5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:                       # the app waits on this
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks: [monitoring]
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Why pgvector, not postgres</span>
+  <p>One database serves three jobs here: relational rows (users, sessions), LangGraph checkpoint blobs,
+  and <code>mem0ai</code>'s embedding index. The third needs the <code>vector</code> extension. Using the
+  pgvector image means one container instead of a separate vector database — a real reduction in operational
+  surface at this scale.</p>
+</div>
+
+<div class="code" data-lang="yaml" data-file="docker-compose.yml — application">
+<pre>
+  app:
+    build:
+      context: .
+      args:
+        APP_ENV: ${APP_ENV:-development}
+    ports: ["8000:8000"]
+    volumes:
+      - ./app:/app/app              # bind mount =&gt; hot reload in dev
+      - ./logs:/app/logs
+    env_file:
+      - .env.${APP_ENV:-development}
+    depends_on:
+      db:
+        condition: service_healthy  # not just "started" — actually accepting connections
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      start_period: 10s
+    restart: on-failure
+    networks: [monitoring]
+</pre>
+</div>
+
+<p>
+  <code>condition: service_healthy</code> is the line that stops the classic startup race, where the API boots,
+  tries <code>SQLModel.metadata.create_all()</code> against a Postgres that is still initialising, and dies.
+</p>
+
+<div class="code" data-lang="yaml" data-file="docker-compose.yml — observability + shared resources">
+<pre>
+  prometheus:                       # scrapes /metrics every 15s
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml"]
+    networks: [monitoring]
+
+  grafana:                          # dashboards provisioned from disk
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks: [monitoring]
+
+  cadvisor:                         # per-container CPU / memory
+    image: gcr.io/cadvisor/cadvisor:latest
+    ports: ["8080:8080"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks: [monitoring]
+
+networks:
+  monitoring:
+    driver: bridge                  # services address each other by name: db, app, …
+volumes:
+  grafana-storage:
+  postgres-data:                    # survives docker compose down
+</pre>
+</div>
+
+<h2 id="toy-topology">Toy example: the topology, service by service</h2>
+<p>Click a service to see what breaks without it and how the others reach it.</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Compose topology explorer</span>
+    <span class="widget-tag">click a node</span>
+  </div>
+  <div class="widget-body">
+    <div class="flow" id="topo-nodes"></div>
+    <div id="topo-detail"></div>
+  </div>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>Config scattered through code</td><td>Changing the model in prod needs a release</td><td>Single <code>Settings</code> object read from env</td></tr>
+    <tr><td>One shared <code>.env</code></td><td>A prod key leaks into a dev shell, or vice versa</td><td>Per-environment files + priority resolution</td></tr>
+    <tr><td>No production overrides</td><td><code>DEBUG=true</code> ships; tracebacks reach users</td><td><code>apply_environment_settings()</code></td></tr>
+    <tr><td>Unpinned dependencies</td><td>"Works on my machine", broken CI on an unrelated PR</td><td>Version floors + <code>uv.lock</code></td></tr>
+    <tr><td>Plain postgres image</td><td><code>ERROR: type "vector" does not exist</code> at first memory write</td><td><code>pgvector/pgvector:pg16</code></td></tr>
+    <tr><td>No healthcheck gate</td><td>API crash-loops for the first 20s of every deploy</td><td><code>depends_on: condition: service_healthy</code></td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const FILES = [".env.development.local", ".env.development", ".env.production", ".env.local", ".env"];
+const TOPO = {
+  db: { label: "db", title: "PostgreSQL 16 + pgvector",
+    body: "Holds three unrelated things in one engine: relational rows (<code>user</code>, <code>session</code>, <code>thread</code>), LangGraph's checkpoint tables, and the pgvector collection mem0ai writes memories into.",
+    reach: "app connects to <code>db:5432</code> — the service name resolves on the <code>monitoring</code> bridge network.",
+    gone: "Nothing starts. The API's <code>depends_on</code> gate never opens, and <code>/health</code> would report <code>degraded</code> if it did." },
+  app: { label: "app", title: "FastAPI application",
+    body: "The thing this whole handbook is about. Built from the local Dockerfile, with <code>./app</code> bind-mounted so a file save restarts Uvicorn in development.",
+    reach: "Exposed on <code>:8000</code>. Scraped by Prometheus at <code>app:8000/metrics</code>.",
+    gone: "Prometheus keeps scraping a dead target — which is exactly how you'd find out, via an <code>up == 0</code> alert." },
+  prometheus: { label: "prometheus", title: "Metrics collection",
+    body: "Pull-based: every 15 seconds it scrapes <code>/metrics</code> from the app and from cAdvisor, and stores the samples as time series.",
+    reach: "UI on <code>:9090</code>; Grafana queries it as a datasource.",
+    gone: "Grafana charts go blank. You lose latency percentiles and RPS — see <a href='10-stress-testing.html'>page 10</a> for what that costs during a load test." },
+  grafana: { label: "grafana", title: "Dashboards",
+    body: "Reads Prometheus and renders it. Dashboards are provisioned from <code>./grafana/dashboards/json</code>, so they exist the moment the container boots — no clicking.",
+    reach: "UI on <code>:3000</code>, default login <code>admin/admin</code>.",
+    gone: "Data is still collected; you just have to query PromQL by hand." },
+  cadvisor: { label: "cadvisor", title: "Container resource metrics",
+    body: "Google's container monitoring agent. Reports CPU, memory, network and filesystem usage per container — the layer beneath your application metrics.",
+    reach: "Scraped by Prometheus at <code>cadvisor:8080</code>. Needs read-only mounts of <code>/sys</code> and the Docker root.",
+    gone: "You can see that requests got slow, but not whether the box was out of memory." },
+};
+
+function pageInit() {
+  /* ---- settings resolver ---- */
+  const boxes = document.getElementById("file-boxes");
+  boxes.innerHTML = FILES.map((f, i) =>
+    `<label><input type="checkbox" class="file-cb" data-f="${f}" ${i === 1 || i === 2 ? "checked" : ""}> ${f}</label>`).join("");
+
+  function resolve() {
+    const raw = document.getElementById("env-select").value;
+    const present = new Set($$(".file-cb").filter(c => c.checked).map(c => c.dataset.f));
+    const debug = document.getElementById("opt-debug").checked;
+    const json = document.getElementById("opt-json").checked;
+    const loose = document.getElementById("opt-loose").checked;
+
+    let env = "development";
+    if (["production", "prod"].includes(raw)) env = "production";
+    else if (["staging", "stage"].includes(raw)) env = "staging";
+    else if (raw === "test") env = "test";
+
+    const order = [`.env.${env}.local`, `.env.${env}`, ".env.local", ".env"];
+    let chosen = null, lines = [];
+    lines.push(`<span class="dim">APP_ENV=</span>${raw}  <span class="dim">→ Environment.${env.toUpperCase()}</span>`);
+    lines.push("");
+    lines.push('<span class="dim">searching in priority order:</span>');
+    for (const f of order) {
+      if (chosen) { lines.push(`  <span class="dim">skip  ${f}  (already loaded)</span>`); continue; }
+      if (present.has(f)) { chosen = f; lines.push(`  <span class="ok">LOAD  ${f}</span>`); }
+      else lines.push(`  <span class="dim">miss  ${f}</span>`);
+    }
+    if (!chosen) lines.push('  <span class="bad">no env file found → defaults only</span>');
+
+    // resolved values, applying the override rules
+    let vDebug = chosen ? debug : false;
+    let vFormat = chosen && json ? "json" : "console";
+    let vLevel = "INFO";
+    let vLimit = chosen && loose ? '["5000 per day"]' : '["200 per day", "50 per hour"]';
+    const overrides = [];
+    if (env === "development") {
+      if (!vDebug) overrides.push("DEBUG      true   (was false)");
+      vDebug = true;
+      if (vFormat !== "console") overrides.push("LOG_FORMAT console (was json)");
+      vFormat = "console"; vLevel = "DEBUG";
+      if (vLimit !== '["1000 per day", "200 per hour"]') overrides.push("RATE_LIMIT relaxed for local dev");
+      vLimit = '["1000 per day", "200 per hour"]';
+    } else if (env === "production") {
+      if (vDebug) overrides.push("DEBUG      false  (env said true — refused)");
+      vDebug = false;
+      if (vFormat !== "json") overrides.push("LOG_FORMAT json   (forced for log shipping)");
+      vFormat = "json"; vLevel = "WARNING";
+      if (vLimit !== '["200 per day", "50 per hour"]') overrides.push("RATE_LIMIT tightened (env value ignored)");
+      vLimit = '["200 per day", "50 per hour"]';
+    }
+
+    lines.push("");
+    lines.push('<span class="dim">resolved settings:</span>');
+    lines.push(`  DEBUG              = <span class="hl">${vDebug}</span>`);
+    lines.push(`  LOG_LEVEL          = <span class="hl">${vLevel}</span>`);
+    lines.push(`  LOG_FORMAT         = <span class="hl">${vFormat}</span>`);
+    lines.push(`  RATE_LIMIT_DEFAULT = <span class="hl">${vLimit}</span>`);
+    if (overrides.length) {
+      lines.push("");
+      lines.push('<span class="warnc">apply_environment_settings() overrode:</span>');
+      overrides.forEach(o => lines.push(`  <span class="warnc">${o}</span>`));
+    }
+    document.getElementById("settings-out").innerHTML = lines.join("\n");
+  }
+  ["env-select", "opt-debug", "opt-json", "opt-loose"].forEach(id =>
+    document.getElementById(id).addEventListener("change", resolve));
+  $$(".file-cb").forEach(c => c.addEventListener("change", resolve));
+  resolve();
+
+  /* ---- topology explorer ---- */
+  const nodes = document.getElementById("topo-nodes");
+  nodes.innerHTML = Object.keys(TOPO).map(k =>
+    `<span class="node" data-k="${k}" style="cursor:pointer">${TOPO[k].label}</span>`).join('<span class="arrow">·</span>');
+  function pick(k) {
+    $$("#topo-nodes .node").forEach(n => n.classList.toggle("active", n.dataset.k === k));
+    const s = TOPO[k];
+    document.getElementById("topo-detail").innerHTML =
+      `<h3 style="margin-top:6px">${s.title}</h3><p>${s.body}</p>
+       <p><strong>Reachable as:</strong> ${s.reach}</p>
+       <div class="note warn" style="margin-bottom:0"><span class="note-title">If it's missing</span><p>${s.gone}</p></div>`;
+  }
+  $$("#topo-nodes .node").forEach(n => n.addEventListener("click", () => pick(n.dataset.k)));
+  pick("db");
+}
+</script>
+</body>
+</html>

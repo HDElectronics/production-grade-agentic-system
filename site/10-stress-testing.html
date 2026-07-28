@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 — Stress testing · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 10 · Operations</div>
+<h1>Architecture stress testing</h1>
+<p class="lede">
+  Everything built so far is a claim. The pool is bounded, the fallback rotates, the metrics are honest — but
+  none of that is <em>known</em> until 1,500 users arrive at once. This page runs the load test, then reads
+  the damage in Prometheus and Langfuse.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  A notebook runs one query at a time. Production runs hundreds. Concurrency does not degrade a system
+  gradually — it finds the one bounded resource you did not think about and pins it. Three specific
+  collapse modes:
+</p>
+<ul>
+  <li><strong>Connection pool exhaustion.</strong> Requests queue on <code>QueuePool.connect()</code>,
+    p95 explodes, and the database looks idle the entire time. (<a href="04-service-layer.html">Layer 04</a>.)</li>
+  <li><strong>Rate-limit collisions.</strong> Your provider's tokens-per-minute quota is shared across all
+    in-flight requests. At high concurrency, everyone hits it simultaneously.</li>
+  <li><strong>Latency amplification.</strong> Retries with exponential backoff make a bad minute worse:
+    every retry is another request against an already-saturated provider.</li>
+</ul>
+
+<h2 id="rig">The test rig</h2>
+<p>
+  A laptop is the wrong load generator — its NIC, its CPU and its home connection become the bottleneck, and
+  you end up measuring your own wifi. The write-up uses an <strong>AWS m6i.xlarge</strong> (4 vCPU, 16 GiB),
+  about <strong>$0.192/hour</strong>. An hour of that is cheap insurance.
+</p>
+
+<div class="code" data-lang="bash" data-file="on the load-generating instance">
+<pre>
+# Ubuntu 22.04 LTS, port 8000 open in the security group
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose
+
+cd our_AI_Agent
+
+# Development mode first — verify the wiring before trusting the numbers
+cp .env.example .env.development
+# (edit .env.development with real API keys)
+
+make docker-run-env ENV=development
+# then visit http://&lt;instance-ip&gt;:8000/docs
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Testing in development mode changes the result</span>
+  <p><code>apply_environment_settings()</code> relaxes the default rate limits in development
+  (1000/day vs 200/day) and sets <code>LOG_LEVEL=DEBUG</code>, which means far more log I/O per request. The
+  run below is therefore optimistic on limits and pessimistic on logging overhead. Fine for shaking out the
+  wiring; re-run against a production profile before you quote the numbers to anyone.</p>
+</div>
+
+<h2 id="script">The load script</h2>
+<p>
+  This is not a health-check ping. Each simulated user performs the <strong>full flow</strong> — login, session
+  creation, then a chat request that runs the graph, hits Postgres and calls the LLM.
+</p>
+
+<div class="code" data-lang="python" data-file="tests/stress_test.py">
+<pre>
+import asyncio, aiohttp, time
+
+BASE_URL = "http://&lt;instance-ip&gt;:8000/api/v1"
+CONCURRENT_USERS = 1500
+
+
+async def simulate_user(session: aiohttp.ClientSession, user_id: int):
+    """Login → create session → chat. The whole user journey, not one endpoint."""
+    try:
+        # 1. Login (form-encoded, OAuth2 password flow)
+        login_data = {"username": f"user{user_id}@test.com",
+                      "password": "StrongPassword123!", "grant_type": "password"}
+        async with session.post(f"{BASE_URL}/auth/login", data=login_data) as resp:
+            if resp.status != 200:
+                return False
+            token = (await resp.json())["access_token"]
+
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 2. Create a chat session — returns its OWN token
+        async with session.post(f"{BASE_URL}/auth/session", headers=headers) as resp:
+            session_token = (await resp.json())["token"]
+
+        session_headers = {"Authorization": f"Bearer {session_token}"}
+
+        # 3. The expensive one: full graph execution
+        payload = {"messages": [{"role": "user",
+                                 "content": "Explain quantum computing briefly."}]}
+        start = time.time()
+        async with session.post(f"{BASE_URL}/chatbot/chat",
+                                json=payload, headers=session_headers) as resp:
+            return {"status": resp.status, "duration": time.time() - start,
+                    "user_id": user_id}
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+async def run_stress_test():
+    print(f"🚀 Starting stress test with {CONCURRENT_USERS} users...")
+    async with aiohttp.ClientSession() as session:
+        tasks = [simulate_user(session, i) for i in range(CONCURRENT_USERS)]
+        results = await asyncio.gather(*tasks)
+    print("✅ Test Completed. Analyzing results...")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_stress_test())
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">This is a thundering herd, not a traffic profile</span>
+  <p><code>asyncio.gather</code> over 1,500 tasks fires every request at t=0. Real traffic arrives on a
+  distribution. A spike test is genuinely useful — it finds the ceiling fast — but it is the <em>harshest</em>
+  possible shape, and passing it does not mean you have measured steady-state behaviour. The ramp and soak
+  variants below tell you different things.</p>
+</div>
+
+<h2 id="toy-load">Toy example: run the load test</h2>
+<p>
+  A model of the system as built: bounded pool, provider quota, tenacity retries, circular fallback. Change the
+  parameters and see which constraint binds first.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Load test simulator</span>
+    <span class="widget-tag">1500 users</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="L-users">concurrent users <span class="val" id="L-users-val"></span></label>
+        <input type="range" id="L-users" min="50" max="3000" step="50" value="1500">
+      </div>
+      <div class="ctrl">
+        <label for="L-pool">pool_size + overflow <span class="val" id="L-pool-val"></span></label>
+        <input type="range" id="L-pool" min="5" max="120" step="5" value="30">
+      </div>
+      <div class="ctrl">
+        <label for="L-quota">provider capacity (req/s) <span class="val" id="L-quota-val"></span></label>
+        <input type="range" id="L-quota" min="20" max="400" step="10" value="200">
+      </div>
+      <div class="ctrl">
+        <label for="L-shape">arrival shape</label>
+        <select id="L-shape">
+          <option value="spike">spike — all at t=0 (as scripted)</option>
+          <option value="ramp">ramp — over 60s</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="L-fb">fallback enabled</label>
+        <select id="L-fb"><option value="1">yes</option><option value="0">no</option></select>
+      </div>
+      <div class="ctrl">
+        <label>&nbsp;</label>
+        <div class="btn-row"><button class="btn" id="L-run">Run test</button></div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">success rate</div><div class="v" id="L-rate">—</div></div>
+      <div class="stat"><div class="k">avg latency</div><div class="v" id="L-avg">—</div></div>
+      <div class="stat"><div class="k">p95 latency</div><div class="v" id="L-p95">—</div></div>
+      <div class="stat"><div class="k">429s</div><div class="v" id="L-429">—</div></div>
+      <div class="stat"><div class="k">pool timeouts</div><div class="v" id="L-to">—</div></div>
+      <div class="stat"><div class="k">fallbacks fired</div><div class="v" id="L-fbn">—</div></div>
+    </div>
+    <div class="out" id="L-out"></div>
+    <div class="widget-note" id="L-note"></div>
+  </div>
+</div>
+
+<h2 id="results">Reading the run</h2>
+<p>The real run holds up. The interesting part is not the success rate — it is the third log line.</p>
+
+<div class="code" data-lang="bash" data-file="stress test output">
+<pre>
+Starting stress test with 1500 users...
+[10:46:22] INFO     [app.core.middleware] request_processed user_id=452  duration=0.85s status=200
+[10:46:22] INFO     [app.core.middleware] request_processed user_id=891  duration=0.92s status=200
+[10:46:22] WARNING  [app.services.llm]    switching_model_fallback old_index=0 new_model=gpt-4o-mini
+[10:46:23] INFO     [app.core.middleware] request_processed user_id=1203 duration=1.45s status=200
+[10:46:24] INFO     [app.core.middleware] request_processed user_id=1455 duration=1.12s status=200
+[10:46:25] ERROR    [app.core.middleware] request_processed user_id=99   duration=5.02s status=429
+...
+
+Test Completed. Analyzing results...
+Total Requests:  1500
+Success Rate:    98.4% (1476/1500)
+Avg Latency:     1.2s
+Failed Requests: 24 (mostly 429 rate limits from OpenAI)
+</pre>
+</div>
+
+<div class="note ok">
+  <span class="note-title">That WARNING line is the whole point of layer 04</span>
+  <p><code>switching_model_fallback old_index=0 new_model=gpt-4o-mini</code>. The provider rate-limited the
+  primary model, tenacity exhausted its retries, and <code>LLMService</code> rotated to the next entry in the
+  registry — mid-incident, with no code path aware it happened. Those users got a slower answer instead of a
+  500. Without that rotation, a chunk of the 98.4% would have been failures.</p>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Read 98.4% carefully</span>
+  <p>It is a success rate over a single 1,500-request spike, with development-relaxed rate limits, measured by
+  HTTP status only. It says nothing about whether the <em>answers</em> were good — the fallback model may have
+  produced measurably worse output, which is invisible here and visible in
+  <a href="09-evaluation.html">layer 09</a>. Availability and quality are separate measurements, and load
+  tests only cover the first.</p>
+</div>
+
+<h2 id="prometheus">Querying Prometheus</h2>
+<p>Logs at this volume are unreadable. The metrics from layer 07 answer aggregate questions directly:</p>
+
+<div class="code" data-lang="python" data-file="analysis script">
+<pre>
+import requests
+
+PROMETHEUS_URL = "http://&lt;instance-ip&gt;:9090"
+
+# rate() = per-second average over the window. NEVER read a counter raw —
+# it resets on restart, and the absolute number is meaningless anyway.
+query = 'rate(http_requests_total[5m])'
+response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={'query': query})
+
+print("📊 Prometheus Metrics:")
+for result in response.json()['data']['result']:
+    endpoint = result['metric'].get('endpoint', 'unknown')
+    value = float(result['value'][1])
+    if value &gt; 0:
+        print(f"Endpoint: {endpoint} | RPS: {value:.2f}")
+</pre>
+</div>
+
+<div class="code" data-lang="bash" data-file="output">
+<pre>
+Prometheus Metrics:
+
+Endpoint: /api/v1/auth/login    | RPS: 245.50
+Endpoint: /api/v1/chatbot/chat  | RPS: 180.20
+Endpoint: /api/v1/auth/session  | RPS: 210.15
+</pre>
+</div>
+
+<p>
+  The ratios are the tell: login &gt; session &gt; chat. Each stage sheds a little traffic — some logins failed,
+  some sessions never got used. In a healthy run all three would be near-equal, since every simulated user
+  performs all three steps. The gap is where users dropped out.
+</p>
+
+<h3>Queries worth having ready before an incident</h3>
+<div class="code" data-lang="bash" data-file="PromQL">
+<pre>
+# Request rate by endpoint
+rate(http_requests_total[5m])
+
+# Error ratio — the number to alert on
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+
+# p95 HTTP latency (needs the _bucket series, not the raw histogram)
+histogram_quantile(0.95,
+  sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))
+
+# p95 LLM inference, split by model — shows the fallback in the data
+histogram_quantile(0.95,
+  sum(rate(llm_inference_duration_seconds_bucket[5m])) by (le, model))
+
+# Is the app being scraped at all?
+up{job="fastapi"}
+</pre>
+</div>
+
+<h2 id="toy-promql">Toy example: PromQL against the run</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">PromQL explorer</span>
+    <span class="widget-tag">query the spike</span>
+  </div>
+  <div class="widget-body">
+    <div class="ctrl" style="margin-bottom:12px">
+      <label for="q-pick">query</label>
+      <select id="q-pick" style="width:100%;max-width:640px">
+        <option value="rps">rate(http_requests_total[5m])</option>
+        <option value="err">error ratio</option>
+        <option value="p95">histogram_quantile(0.95, … http_request_duration_seconds_bucket …)</option>
+        <option value="llm">p95 llm_inference_duration_seconds by model</option>
+        <option value="raw">http_requests_total &nbsp;<span>(the wrong query)</span></option>
+        <option value="up">up{job="fastapi"}</option>
+      </select>
+    </div>
+    <div class="out" id="q-out"></div>
+    <div class="widget-note" id="q-note"></div>
+  </div>
+</div>
+
+<h2 id="langfuse">Checking Langfuse</h2>
+<p>
+  Prometheus proves requests were served. It cannot tell you whether the agent was <em>thinking</em> or just
+  erroring out fast. Traces carry per-run latency and cost:
+</p>
+
+<div class="code" data-lang="python" data-file="analysis script">
+<pre>
+from langfuse import Langfuse
+langfuse = Langfuse()
+
+traces = langfuse.get_traces(limit=5)
+
+print("\n🧠 Langfuse Traces (Recent):")
+for trace in traces.data:
+    print(f"Trace ID: {trace.id} | Latency: {trace.latency}s | Cost: ${trace.total_cost:.5f}")
+</pre>
+</div>
+
+<div class="code" data-lang="bash" data-file="output">
+<pre>
+Langfuse Traces (Recent):
+Trace ID: 89a1b2… | Latency: 1.45s | Cost: $0.00042
+Trace ID: 77c3d4… | Latency: 0.98s | Cost: $0.00015
+Trace ID: 12e5f6… | Latency: 2.10s | Cost: $0.00045
+Trace ID: 99g8h7… | Latency: 1.12s | Cost: $0.00030
+Trace ID: 44i9j0… | Latency: 1.33s | Cost: $0.00038
+</pre>
+</div>
+
+<p>
+  Latency spread from 0.98s to 2.10s across five traces, and cost varying nearly 3× — different models handled
+  different requests, which is the fallback rotation showing up in the billing data. That per-request cost is
+  the number your unit economics rest on: at $0.0003 a turn, 10,000 users averaging 20 turns a day is roughly
+  <strong>$60/day</strong> in inference alone, before you count the memory-extraction call that fires after
+  every response.
+</p>
+
+<h2 id="toy-capacity">Toy example: capacity and unit economics</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Capacity planner</span>
+    <span class="widget-tag">back of the envelope</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="c-users">active users <span class="val" id="c-users-val"></span></label>
+        <input type="range" id="c-users" min="500" max="50000" step="500" value="10000">
+      </div>
+      <div class="ctrl">
+        <label for="c-turns">turns / user / day <span class="val" id="c-turns-val"></span></label>
+        <input type="range" id="c-turns" min="1" max="60" value="20">
+      </div>
+      <div class="ctrl">
+        <label for="c-peak">peak-to-average ratio <span class="val" id="c-peak-val"></span></label>
+        <input type="range" id="c-peak" min="2" max="20" value="8" data-suffix="×">
+      </div>
+      <div class="ctrl">
+        <label for="c-lat">avg turn latency <span class="val" id="c-lat-val"></span></label>
+        <input type="range" id="c-lat" min="500" max="5000" step="100" value="1200" data-suffix=" ms">
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">peak RPS</div><div class="v" id="c-rps">—</div></div>
+      <div class="stat"><div class="k">concurrent in flight</div><div class="v" id="c-conc">—</div></div>
+      <div class="stat"><div class="k">DB connections needed</div><div class="v" id="c-db">—</div></div>
+      <div class="stat"><div class="k">inference $/day</div><div class="v" id="c-cost">—</div></div>
+      <div class="stat"><div class="k">inference $/month</div><div class="v" id="c-month">—</div></div>
+      <div class="stat"><div class="k">$ / user / month</div><div class="v" id="c-per">—</div></div>
+    </div>
+    <div class="out" id="c-out"></div>
+    <div class="widget-note" id="c-note"></div>
+  </div>
+</div>
+
+<h2 id="beyond">Beyond the spike test</h2>
+<table>
+  <thead><tr><th>Test</th><th>Shape</th><th>What only it finds</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Spike</strong></td><td>All users at t=0</td><td>Hard ceilings: pool size, provider quota, accept queue</td></tr>
+    <tr><td><strong>Ramp</strong></td><td>Linear increase over minutes</td><td>The <em>knee</em> — the exact concurrency where latency turns non-linear</td></tr>
+    <tr><td><strong>Soak</strong></td><td>Moderate load for hours</td><td>Memory leaks, connection leaks, unbounded caches, disk-full from logs</td></tr>
+    <tr><td><strong>Chaos</strong></td><td>Kill the DB mid-run</td><td>Whether <code>pool_pre_ping</code> and the degraded-start paths actually work</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <span class="note-title">The soak test is the one people skip</span>
+  <p>A spike test that passes in 90 seconds cannot reveal a connection leaked once per exception. Run moderate
+  load for four hours and watch <code>db_connections</code> — which, as noted on
+  <a href="07-observability.html">page 07</a>, this codebase declares but never populates. Wiring that gauge
+  up is a prerequisite for the soak test to tell you anything.</p>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>No load testing</td><td>Launch day is your first concurrency test, in front of users</td><td>A spike test before release</td></tr>
+    <tr><td>Testing from a laptop</td><td>You measured your home wifi, not the system</td><td>A cloud instance as the generator</td></tr>
+    <tr><td>Pinging <code>/health</code> only</td><td>Green results while the real path collapses</td><td>Simulate the full user journey</td></tr>
+    <tr><td>Reading logs, not metrics</td><td>Drowning in lines; no aggregate visible</td><td>PromQL over the scrape data</td></tr>
+    <tr><td>Ignoring cost per trace</td><td>Unit economics discovered on the invoice</td><td>Langfuse cost per trace</td></tr>
+    <tr><td>Only spike testing</td><td>Leaks that need hours to appear ship to production</td><td>Add ramp and soak runs</td></tr>
+    <tr><td>Testing in dev mode</td><td>Relaxed limits give an optimistic number</td><td>Re-run against a production profile</td></tr>
+  </tbody>
+</table>
+
+<hr>
+
+<h2 id="end">Where this leaves you</h2>
+<p>
+  Ten layers: a modular codebase with environment-aware settings, a typed persistence layer, guards at the
+  perimeter, services that absorb dependency failure, a stateful agent with two kinds of memory, a streaming
+  API, three signals of observability, reproducible builds, continuous evaluation, and evidence that it holds
+  under load.
+</p>
+<p>
+  None of it is exotic. It is the ordinary discipline of running software, applied to a component that is
+  non-deterministic, slow and metered — which is exactly why the discipline matters more here, not less.
+  The gaps flagged along the way (a real circuit breaker, the unwired <code>db_connections</code> gauge, tests
+  in CI, immutable image tags, multi-stage builds, bounded tool loops) are the honest next commits.
+</p>
+<p><a href="index.html">← Back to the table of contents</a></p>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const PROM = {
+  rps: { out:
+`<span class="dim">rate(http_requests_total[5m])</span>
+
+Endpoint: /api/v1/auth/login    | RPS: <span class="hl">245.50</span>
+Endpoint: /api/v1/auth/session  | RPS: <span class="hl">210.15</span>
+Endpoint: /api/v1/chatbot/chat  | RPS: <span class="hl">180.20</span>`,
+    note: "Per-second rate averaged over a 5-minute window. The descending ladder is the funnel: 245 logins produced 210 sessions produced 180 chats. In a clean run all three would be equal — every simulated user does all three steps — so the ~27% gap between login and chat is exactly the traffic that dropped out." },
+  err: { out:
+`<span class="dim">sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))</span>
+
+{} <span class="ok">0.0</span>
+
+<span class="dim">and the same for 4xx:</span>
+{} <span class="warnc">0.016</span>   <span class="dim">← the 24 rate-limited requests</span>`,
+    note: "<strong>Zero 5xx.</strong> Everything that failed did so as a 429 — a deliberate, handled rejection, not a crash. That distinction is the difference between \"the system shed load correctly\" and \"the system fell over\", and it is the single most important number to alert on." },
+  p95: { out:
+`<span class="dim">histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))</span>
+
+{endpoint="/api/v1/auth/login"}   <span class="ok">0.31</span>
+{endpoint="/api/v1/auth/session"} <span class="ok">0.28</span>
+{endpoint="/api/v1/chatbot/chat"} <span class="warnc">3.90</span>`,
+    note: "Auth endpoints are pure database work and stay under a third of a second. Chat is 3.9s at p95 against a 1.2s average — the gap is where retries and fallbacks live. Note <code>by (le, endpoint)</code>: dropping <code>le</code> makes the function silently wrong, because it needs the bucket boundary label to interpolate." },
+  llm: { out:
+`<span class="dim">histogram_quantile(0.95, sum(rate(llm_inference_duration_seconds_bucket[5m])) by (le, model))</span>
+
+{model="gpt-5-mini"}  <span class="warnc">+Inf</span>   <span class="dim">← exceeded the 5.0s top bucket</span>
+{model="gpt-4o-mini"} <span class="ok">1.80</span>
+{model="gpt-4o"}      <span class="ok">2.40</span>`,
+    note: "<strong>Two findings in three rows.</strong> First, the fallback is visible in the data — three models served traffic when only one was configured as default. Second, <code>gpt-5-mini</code> reports <code>+Inf</code>: its p95 exceeded the largest bucket (5.0s), so Prometheus cannot estimate it. The buckets need a higher ceiling before this number means anything. See the histogram explorer on <a href='07-observability.html'>page 07</a>." },
+  raw: { out:
+`<span class="dim">http_requests_total</span>
+
+{method="POST", endpoint="/api/v1/chatbot/chat", status="200"}  <span class="hl">1476</span>
+{method="POST", endpoint="/api/v1/chatbot/chat", status="429"}  <span class="hl">24</span>`,
+    note: "<strong>Almost always the wrong query.</strong> A counter is cumulative since process start, so this number means \"since the last deploy\" — and it silently resets to zero on restart, producing a cliff in any graph. Wrap counters in <code>rate()</code> or <code>increase()</code>; the raw value is only useful for a one-off sanity check like this one." },
+  up: { out:
+`<span class="dim">up{job="fastapi"}</span>
+
+{instance="app:8000", job="fastapi"}    <span class="ok">1</span>
+{instance="cadvisor:8080", job="cadvisor"} <span class="ok">1</span>`,
+    note: "A synthetic metric Prometheus generates for every scrape: 1 if the target answered, 0 if it did not. This is how a pull-based system distinguishes \"healthy and quiet\" from \"dead\" — a push-based system sees silence in both cases. <code>up == 0</code> is usually the first alert anyone writes." },
+};
+
+function pageInit() {
+  /* ============ load test ============ */
+  function runLoad() {
+    const users = Number(document.getElementById("L-users").value);
+    const cap = Number(document.getElementById("L-pool").value);
+    const quota = Number(document.getElementById("L-quota").value);
+    const spike = document.getElementById("L-shape").value === "spike";
+    const fb = document.getElementById("L-fb").value === "1";
+
+    const windowS = spike ? 8 : 60;                 // how long arrivals are spread over
+    const arrivalRps = users / windowS;
+    const dbTime = 0.05, llmTime = 0.9;
+
+    // provider saturation
+    const overQuota = Math.max(0, arrivalRps - quota) / Math.max(arrivalRps, 1);
+    // fallback recovers most of the over-quota traffic, at a latency cost
+    const rateLimited = fb ? overQuota * 0.12 : overQuota * 0.75;
+    const fallbacks = fb ? Math.round(users * overQuota * 0.55) : 0;
+
+    // pool queueing
+    const dbConcurrency = arrivalRps * dbTime * 3;   // 3 db ops per user journey
+    const poolPressure = Math.max(0, dbConcurrency - cap) / Math.max(dbConcurrency, 1);
+    const poolQueueWait = poolPressure * 6;
+    const timeouts = poolQueueWait > 30 ? Math.round(users * 0.05) : 0;
+
+    const retryPenalty = fb ? overQuota * 4.5 : overQuota * 6;
+    const avg = llmTime + dbTime * 3 + poolQueueWait * 0.4 + retryPenalty * 0.35;
+    const p95 = avg * (1.9 + poolPressure * 2.2 + overQuota * 1.6);
+
+    const failed = Math.round(users * rateLimited) + timeouts;
+    const okN = users - failed;
+    const rate = okN / users * 100;
+
+    const set = (id, v, cls) => { const e = document.getElementById(id); e.textContent = v; if (cls !== undefined) e.className = "v " + cls; };
+    set("L-rate", rate.toFixed(1) + "%", rate > 97 ? "good" : rate > 90 ? "warn" : "bad");
+    set("L-avg", avg.toFixed(2) + "s", avg < 2 ? "good" : avg < 5 ? "warn" : "bad");
+    set("L-p95", p95.toFixed(2) + "s", p95 < 4 ? "good" : p95 < 10 ? "warn" : "bad");
+    set("L-429", Math.round(users * rateLimited), rateLimited > 0.05 ? "bad" : rateLimited > 0 ? "warn" : "good");
+    set("L-to", timeouts, timeouts ? "bad" : "good");
+    set("L-fbn", fallbacks, fallbacks ? "warn" : "good");
+
+    const L = [];
+    L.push(`<span class="dim">🚀 Starting stress test with ${users} users...</span>`);
+    L.push(`<span class="dim">arrival: ${spike ? "spike, all at t=0" : "ramp over 60s"} → ${arrivalRps.toFixed(0)} req/s offered</span>\n`);
+    L.push(`  <span class="ok">INFO </span>  request_processed user_id=452  duration=${(avg * 0.7).toFixed(2)}s status=200`);
+    if (fallbacks) L.push(`  <span class="warnc">WARN </span>  switching_model_fallback old_index=0 new_model=gpt-4o-mini`);
+    L.push(`  <span class="ok">INFO </span>  request_processed user_id=1203 duration=${(avg * 1.2).toFixed(2)}s status=200`);
+    if (rateLimited > 0) L.push(`  <span class="bad">ERROR</span>  request_processed user_id=99   duration=${(avg * 3).toFixed(2)}s status=429`);
+    if (timeouts) L.push(`  <span class="bad">ERROR</span>  database_error QueuePool limit of size ${cap} overflow reached, connection timed out, timeout 30.00`);
+    L.push(`\n<span class="dim">Test Completed.</span>`);
+    L.push(`Total Requests:  ${users}`);
+    L.push(`Success Rate:    <span class="${rate > 97 ? "ok" : "bad"}">${rate.toFixed(1)}% (${okN}/${users})</span>`);
+    L.push(`Avg Latency:     ${avg.toFixed(2)}s`);
+    L.push(`Failed Requests: ${failed}${failed ? ` (${Math.round(users * rateLimited)} rate limits, ${timeouts} pool timeouts)` : ""}`);
+    document.getElementById("L-out").innerHTML = L.join("\n");
+
+    const notes = [];
+    if (timeouts) notes.push(`<strong style="color:var(--danger)">The pool is the binding constraint.</strong> ${dbConcurrency.toFixed(0)} concurrent database operations against a capacity of ${cap}. Requests are dying in <code>QueuePool.connect()</code> after 30 seconds without ever reaching Postgres — which will look completely idle. Raise pool_size + max_overflow, or add workers.`);
+    else if (poolPressure > 0.2) notes.push(`<span style="color:var(--warn)">The pool is queueing</span> (${dbConcurrency.toFixed(0)} concurrent ops vs ${cap} capacity), adding roughly ${poolQueueWait.toFixed(1)}s of pure waiting to the tail. Not yet timing out, but this is the p95 climbing for a reason no slow-query log will explain.`);
+    if (overQuota > 0.05 && !fb) notes.push(`<strong style="color:var(--danger)">Fallback is off and the provider is saturated.</strong> ${(overQuota * 100).toFixed(0)}% of demand exceeds the quota, and without model rotation most of it becomes a user-visible failure. Turn fallback on and compare.`);
+    else if (overQuota > 0.05) notes.push(`<span style="color:var(--ok)">Fallback is absorbing the overload.</span> ${(overQuota * 100).toFixed(0)}% of demand exceeded the primary model's quota; ${fallbacks} requests rotated to another model and succeeded slowly instead of failing. This is the <code>switching_model_fallback</code> line in the real run.`);
+    if (!spike) notes.push(`Ramping over 60s reduces offered load to ${arrivalRps.toFixed(0)} req/s. The same 1,500 users are far less damaging when they do not arrive simultaneously — which is why a passing spike test is a strong result, and a failing one is not necessarily a production problem.`);
+    if (!notes.length) notes.push(`<span style="color:var(--ok)">Comfortable.</span> Neither the pool nor the provider quota is binding. Raise users until something gives — the point of the exercise is to find the ceiling, not to pass.`);
+    document.getElementById("L-note").innerHTML = notes.join(" ");
+  }
+  ["L-users", "L-pool", "L-quota"].forEach(id => bindRange(id, runLoad));
+  document.getElementById("L-shape").addEventListener("change", runLoad);
+  document.getElementById("L-fb").addEventListener("change", runLoad);
+  document.getElementById("L-run").addEventListener("click", runLoad);
+  runLoad();
+
+  /* ============ promql ============ */
+  function qRender() {
+    const p = PROM[document.getElementById("q-pick").value];
+    document.getElementById("q-out").innerHTML = p.out;
+    document.getElementById("q-note").innerHTML = p.note;
+  }
+  document.getElementById("q-pick").addEventListener("change", qRender);
+  qRender();
+
+  /* ============ capacity ============ */
+  function cRender() {
+    const users = Number(document.getElementById("c-users").value);
+    const turns = Number(document.getElementById("c-turns").value);
+    const peak = Number(document.getElementById("c-peak").value);
+    const lat = Number(document.getElementById("c-lat").value) / 1000;
+
+    const perDay = users * turns;
+    const avgRps = perDay / 86400;
+    const peakRps = avgRps * peak;
+    const inFlight = peakRps * lat;                    // Little's law
+    const dbConns = Math.ceil(inFlight * 0.15) + 5;    // db work is a fraction of the turn
+    const costDay = perDay * 0.0003 * 1.6;             // +60% for the memory-extraction call
+    const perUser = costDay * 30 / users;
+
+    const set = (id, v, cls) => { const e = document.getElementById(id); e.textContent = v; if (cls !== undefined) e.className = "v " + cls; };
+    set("c-rps", peakRps.toFixed(1));
+    set("c-conc", Math.ceil(inFlight), inFlight > 400 ? "bad" : inFlight > 150 ? "warn" : "good");
+    set("c-db", dbConns, dbConns > 100 ? "bad" : dbConns > 40 ? "warn" : "good");
+    set("c-cost", "$" + costDay.toFixed(0));
+    set("c-month", "$" + (costDay * 30).toLocaleString(undefined, { maximumFractionDigits: 0 }));
+    set("c-per", "$" + perUser.toFixed(2), perUser > 2 ? "warn" : "good");
+
+    document.getElementById("c-out").innerHTML =
+`<span class="dim">${users.toLocaleString()} users × ${turns} turns = ${perDay.toLocaleString()} turns/day</span>
+<span class="dim">average ${avgRps.toFixed(2)} rps × ${peak}× peak factor = ${peakRps.toFixed(1)} rps at peak</span>
+<span class="dim">Little's law: ${peakRps.toFixed(1)} rps × ${lat}s = ${inFlight.toFixed(0)} requests in flight</span>
+<span class="dim">cost assumes ~$0.0003/turn inference + ~60% for the mem0ai extraction call</span>`;
+
+    const notes = [];
+    if (dbConns > 100) notes.push(`<strong style="color:var(--danger)">${dbConns} database connections</strong> across your fleet. Default Postgres <code>max_connections</code> is 100 — you need PgBouncer, or fewer/larger workers, before this shape is deployable.`);
+    else notes.push(`Roughly <strong>${dbConns} database connections</strong> at peak. With <code>pool_size=20, max_overflow=10</code> that is ${Math.ceil(dbConns / 30)} worker process(es) — comfortably inside a default <code>max_connections</code>.`);
+    notes.push(`Inference alone is <strong>$${perUser.toFixed(2)}/user/month</strong>. Whatever you charge has to clear that plus infrastructure, and the memory-extraction call is a real line item — it is a second LLM call on every single turn.`);
+    if (peak >= 12) notes.push(`A ${peak}× peak factor means you are provisioning for a spike that lasts minutes a day. Autoscaling on RPS, or a queue in front of the chat endpoint, is cheaper than sizing the steady state for it.`);
+    document.getElementById("c-note").innerHTML = notes.join(" ");
+  }
+  ["c-users", "c-turns", "c-peak", "c-lat"].forEach(id => bindRange(id, cRender));
+  cRender();
+}
+</script>
+</body>
+</html>

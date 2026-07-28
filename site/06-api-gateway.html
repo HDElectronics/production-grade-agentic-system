@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 — API gateway · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 06 · Core</div>
+<h1>Building the API gateway</h1>
+<p class="lede">
+  The public surface. Two ideas carry it: <strong>dependency injection</strong>, so authentication is declared
+  rather than repeated, and <strong>Server-Sent Events</strong>, so a ten-second generation feels like a
+  hundred-millisecond one.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  Every protected route needs the same six steps: read the header, sanitise it, verify the signature, check
+  expiry, load the subject, bind it to the logging context. Written inline, that is six chances per route to
+  get it wrong — and the route someone forgets is the one that gets found.
+</p>
+<p>
+  Second problem: LLMs are slow. A blocking <code>/chat</code> that returns after eight seconds is
+  indistinguishable from a broken one. Streaming does not make generation faster; it makes the wait legible.
+</p>
+
+<h2 id="routes">The route surface</h2>
+<table>
+  <thead><tr><th>Method &amp; path</th><th>Auth</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /auth/register</code></td><td>none</td><td>Create a user, return an auto-login token</td></tr>
+    <tr><td><code>POST /auth/login</code></td><td>none</td><td>OAuth2 form login → user token</td></tr>
+    <tr><td><code>POST /auth/session</code></td><td>user token</td><td>Open a new chat thread → session token</td></tr>
+    <tr><td><code>GET /auth/sessions</code></td><td>user token</td><td>List threads, re-issuing a token for each</td></tr>
+    <tr><td><code>PATCH /auth/session/{id}/name</code></td><td>session token</td><td>Rename a thread</td></tr>
+    <tr><td><code>DELETE /auth/session/{id}</code></td><td>session token</td><td>Delete a thread</td></tr>
+    <tr><td><code>POST /chatbot/chat</code></td><td>session token</td><td>Blocking turn — full response at once</td></tr>
+    <tr><td><code>POST /chatbot/chat/stream</code></td><td>session token</td><td>SSE token stream</td></tr>
+    <tr><td><code>GET /chatbot/messages</code></td><td>session token</td><td>Replay history from checkpoints</td></tr>
+    <tr><td><code>DELETE /chatbot/messages</code></td><td>session token</td><td>Wipe thread checkpoints</td></tr>
+    <tr><td><code>GET /api/v1/health</code></td><td>none</td><td>Liveness for load balancers</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <span class="note-title">Two token types, deliberately</span>
+  <p>A <strong>user token</strong> has <code>sub = user.id</code> and can open sessions. A <strong>session token</strong>
+  has <code>sub = session.id</code> and can only talk to that one thread. A leaked session token exposes one
+  conversation; a leaked user token exposes the account. Both are minted by the same
+  <code>create_access_token</code> — the scoping is entirely in what you put in <code>sub</code>, which means
+  the two dependency functions below are what actually enforce the boundary.</p>
+</div>
+
+<h2 id="di">Dependency injection as an auth gate</h2>
+<p>
+  FastAPI resolves declared dependencies <em>before</em> the handler body runs. Raise inside a dependency and
+  the handler never executes — which is what makes this a gate and not a convention.
+</p>
+
+<div class="code" data-lang="python" data-file="src/interface/auth.py">
+<pre>
+router = APIRouter()
+security = HTTPBearer()          # expects: Authorization: Bearer &lt;token&gt;
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -&gt; User:
+    try:
+        # Headers are user input like any other
+        token = sanitize_string(credentials.credentials)
+
+        user_id = verify_token(token)                 # signature + expiry
+        if user_id is None:
+            logger.warning("invalid_token_attempt")
+            raise HTTPException(status_code=401,
+                                detail="Invalid authentication credentials",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+        # Signature valid ≠ user still exists. Deleted accounts hold
+        # valid tokens for the rest of the 30-day window.
+        user = await database_service.get_user(int(user_id))
+        if user is None:
+            logger.warning("user_not_found_from_token", user_id=user_id)
+            raise HTTPException(status_code=404, detail="User not found",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+        # Every log line from here on carries user_id automatically
+        bind_context(user_id=int(user_id))
+        return user
+
+    except ValueError as ve:
+        logger.error("token_validation_error", error=str(ve))
+        raise HTTPException(status_code=422, detail="Invalid token format",
+                            headers={"WWW-Authenticate": "Bearer"})
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="src/interface/auth.py">
+<pre>
+async def get_current_session(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -&gt; Session:
+    """Same shape, but the subject is a session id."""
+    try:
+        token = sanitize_string(credentials.credentials)
+        session_id = verify_token(token)
+        if session_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        session = await database_service.get_session(sanitize_string(session_id))
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        bind_context(user_id=session.user_id, session_id=session.id)
+        return session
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid token format")
+</pre>
+</div>
+
+<p>Using it costs one line, and the type annotation is the documentation:</p>
+
+<div class="code" data-lang="python" data-file="src/interface/interaction.py">
+<pre>
+@router.post("/chat", response_model=ChatResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat"][0])
+async def chat(
+    request: Request,
+    chat_request: ChatRequest,
+    session: Session = Depends(get_current_session),   # ← the whole auth story
+):
+    result = await agent.get_response(
+        chat_request.messages,
+        session_id=session.id,               # thread_id for graph persistence
+        user_id=str(session.user_id),        # tenancy key for long-term memory
+    )
+    return ChatResponse(messages=result)
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Authentication, not authorisation</span>
+  <p><code>get_current_session</code> proves the caller holds a valid token for <em>a</em> session and loads it.
+  Because the session id comes from inside the signed token rather than from the URL, a caller cannot point at
+  someone else's thread — the signature is the ownership proof. That works for the chat routes. For any route
+  that takes an id in the <em>path</em>, though, you need an explicit
+  <code>session.user_id == current_user.id</code> check; the dependency alone will not save you there.</p>
+</div>
+
+<h2 id="toy-di">Toy example: dependency resolution, request by request</h2>
+<p>
+  Choose what the client sends and watch FastAPI resolve the chain. Note where each request dies — the
+  earlier the exit, the less it cost you.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Auth dependency resolver</span>
+    <span class="widget-tag">Depends()</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="di-case">incoming request</label>
+        <select id="di-case">
+          <option value="ok">valid session token</option>
+          <option value="none">no Authorization header</option>
+          <option value="garbage">malformed token ("abc.def")</option>
+          <option value="badsig">valid shape, wrong signature</option>
+          <option value="expired">correctly signed, expired</option>
+          <option value="deleted">valid token, session deleted from DB</option>
+          <option value="usertoken">user token sent to a session route</option>
+          <option value="ratelimited">valid token, but over the rate limit</option>
+        </select>
+      </div>
+    </div>
+    <div class="out" id="di-out"></div>
+    <div id="di-note" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<h2 id="register">Registration and login</h2>
+
+<div class="code" data-lang="python" data-file="src/interface/auth.py">
+<pre>
+@router.post("/register", response_model=UserResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["register"][0])
+async def register_user(request: Request, user_data: UserCreate):
+    try:
+        # 1. Sanitise + validate (Pydantic already ran; this is belt and braces)
+        sanitized_email = sanitize_email(user_data.email)
+        password = user_data.password.get_secret_value()
+        validate_password_strength(password)
+
+        # 2. Uniqueness check
+        if await database_service.get_user_by_email(sanitized_email):
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        # 3. Hash, then persist. The plaintext never leaves this function.
+        hashed = User.hash_password(password)
+        user = await database_service.create_user(email=sanitized_email,
+                                                  password_hash=hashed)
+
+        # 4. Auto-login: no second round trip to use the account
+        token = create_access_token(str(user.id))
+        return UserResponse(id=user.id, email=user.email, token=token)
+
+    except ValueError as ve:
+        logger.warning("registration_validation_failed", error=str(ve))
+        raise HTTPException(status_code=422, detail=str(ve))
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">This endpoint is a user enumeration oracle</span>
+  <p>"Email already registered" tells an anonymous caller which addresses have accounts. That is a deliberate
+  usability trade almost every product makes, but it <em>is</em> a trade — the privacy-preserving alternative
+  is to always return 202 and send a "you already have an account" email instead. Rate limiting the endpoint
+  (as done here) limits harvesting speed; it does not close the oracle.</p>
+</div>
+
+<div class="code" data-lang="python" data-file="src/interface/auth.py">
+<pre>
+@router.post("/login", response_model=TokenResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["login"][0])
+async def login(
+    request: Request,
+    # OAuth2 password flow uses form fields, not JSON. This is what makes
+    # the "Authorize" button work in /docs.
+    username: str = Form(...),
+    password: str = Form(...),
+    grant_type: str = Form(default="password"),
+):
+    try:
+        username = sanitize_string(username)
+        password = sanitize_string(password)
+
+        if grant_type != "password":
+            raise HTTPException(status_code=400, detail="Unsupported grant type")
+
+        user = await database_service.get_user_by_email(username)
+
+        # One message for both cases: "no such user" and "wrong password"
+        # are indistinguishable to the caller.
+        if not user or not user.verify_password(password):
+            logger.warning("login_failed", email=username)
+            raise HTTPException(status_code=401,
+                                detail="Incorrect email or password",
+                                headers={"WWW-Authenticate": "Bearer"})
+
+        token = create_access_token(str(user.id))
+        logger.info("user_logged_in", user_id=user.id)
+        return TokenResponse(access_token=token.access_token, token_type="bearer",
+                             expires_at=token.expires_at)
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Sanitising the password is a subtle trap</span>
+  <p><code>sanitize_string</code> HTML-escapes its input, so a password containing <code>&amp;</code> or
+  <code>&lt;</code> becomes a different string. As long as registration applies the exact same transformation
+  the hashes match and nobody notices — but the two paths are now coupled forever, and changing the sanitiser
+  would lock out every affected user. Passwords are opaque bytes; hash them as given.</p>
+</div>
+
+<h3>Sessions</h3>
+<div class="code" data-lang="python" data-file="src/interface/auth.py">
+<pre>
+@router.post("/session", response_model=SessionResponse)
+async def create_session(user: User = Depends(get_current_user)):
+    session_id = str(uuid.uuid4())          # unguessable, not sequential
+    session = await database_service.create_session(session_id, user.id)
+
+    # A token scoped to this thread only
+    token = create_access_token(session_id)
+    logger.info("session_created", session_id=session_id, user_id=user.id)
+    return SessionResponse(session_id=session_id, name=session.name, token=token)
+
+
+@router.get("/sessions", response_model=List[SessionResponse])
+async def get_user_sessions(user: User = Depends(get_current_user)):
+    sessions = await database_service.get_user_sessions(user.id)
+    return [
+        SessionResponse(session_id=s.id, name=s.name,
+                        token=create_access_token(s.id))   # re-issued so the UI can resume
+        for s in sessions
+    ]
+</pre>
+</div>
+
+<h2 id="sse">Real-time streaming with SSE</h2>
+<p>
+  Server-Sent Events is a one-directional text protocol over plain HTTP: frames of
+  <code>data: &lt;payload&gt;\n\n</code>, held open until the server closes it. No WebSocket handshake, no extra
+  infrastructure, and every browser speaks it natively via <code>EventSource</code>.
+</p>
+
+<div class="code" data-lang="python" data-file="src/interface/interaction.py">
+<pre>
+@router.post("/chat/stream")
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat_stream"][0])
+async def chat_stream(request: Request, chat_request: ChatRequest,
+                      session: Session = Depends(get_current_session)):
+    try:
+        logger.info("stream_chat_init", session_id=session.id)
+
+        async def event_generator():
+            try:
+                async for chunk in agent.get_stream_response(
+                    chat_request.messages,
+                    session_id=session.id,
+                    user_id=str(session.user_id),
+                ):
+                    # Structured frames, not bare text — the client can tell
+                    # content from control without parsing prose.
+                    response = StreamResponse(content=chunk, done=False)
+                    yield f"data: {json.dumps(response.model_dump())}\n\n"
+
+                # Explicit terminator so the client stops listening
+                final_response = StreamResponse(content="", done=True)
+                yield f"data: {json.dumps(final_response.model_dump())}\n\n"
+
+            except Exception as e:
+                # CRITICAL: headers were already sent, so you cannot switch
+                # to a 500 here. The error must be delivered IN the stream.
+                logger.error("stream_crash", session_id=session.id, error=str(e))
+                error_response = StreamResponse(content=f"Error: {str(e)}", done=True)
+                yield f"data: {json.dumps(error_response.model_dump())}\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    except Exception as e:
+        # Only reachable before the first byte is written
+        logger.error("stream_request_failed", session_id=session.id, error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+</pre>
+</div>
+
+<div class="note danger">
+  <span class="note-title">Two try/except blocks, two different worlds</span>
+  <p>The outer one can still return a proper HTTP error, because nothing has been written yet. The inner one
+  cannot — the status line and headers left the building the moment <code>StreamingResponse</code> started.
+  Anything that fails mid-stream <em>must</em> be encoded as a frame, or the client sees a truncated response
+  with a 200 status and no idea whether it is complete. This asymmetry is the single most common bug in
+  hand-rolled streaming endpoints.</p>
+</div>
+
+<h2 id="toy-sse">Toy example: blocking vs streaming</h2>
+<p>
+  Both bars finish at the same moment. Only one of them is bearable. Watch the raw SSE frames on the right.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">SSE stream player</span>
+    <span class="widget-tag">text/event-stream</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="s-ttft">time to first token <span class="val" id="s-ttft-val"></span></label>
+        <input type="range" id="s-ttft" min="100" max="2500" step="100" value="600" data-suffix=" ms">
+      </div>
+      <div class="ctrl">
+        <label for="s-rate">tokens / second <span class="val" id="s-rate-val"></span></label>
+        <input type="range" id="s-rate" min="5" max="120" step="5" value="35">
+      </div>
+      <div class="ctrl">
+        <label for="s-crash">inject a mid-stream failure</label>
+        <select id="s-crash"><option value="0">no</option><option value="1">yes</option></select>
+      </div>
+      <div class="ctrl">
+        <label>&nbsp;</label>
+        <div class="btn-row"><button class="btn" id="s-go">Send request</button></div>
+      </div>
+    </div>
+    <div class="two-col">
+      <div>
+        <h4 style="margin-top:0">POST /chatbot/chat <span class="dim">(blocking)</span></h4>
+        <div class="out" id="s-block" style="min-height:150px"></div>
+        <h4>POST /chatbot/chat/stream <span class="dim">(SSE)</span></h4>
+        <div class="out" id="s-stream" style="min-height:150px"></div>
+      </div>
+      <div>
+        <h4 style="margin-top:0">raw wire frames</h4>
+        <div class="out" id="s-wire" style="max-height:330px"></div>
+      </div>
+    </div>
+    <div class="stats" style="margin-top:14px">
+      <div class="stat"><div class="k">blocking: first byte</div><div class="v bad" id="s-b-ttfb">—</div></div>
+      <div class="stat"><div class="k">streaming: first byte</div><div class="v good" id="s-s-ttfb">—</div></div>
+      <div class="stat"><div class="k">total (both)</div><div class="v" id="s-total">—</div></div>
+      <div class="stat"><div class="k">frames sent</div><div class="v" id="s-frames">0</div></div>
+    </div>
+    <div class="widget-note" id="s-note">
+      The two endpoints call the same graph and finish at the same instant. The only difference is when the
+      user sees evidence that something is happening.
+    </div>
+  </div>
+</div>
+
+<h2 id="router">Aggregating the routers</h2>
+<div class="code" data-lang="python" data-file="src/interface/router.py">
+<pre>
+api_router = APIRouter()
+
+api_router.include_router(auth_router,    prefix="/auth",    tags=["auth"])
+api_router.include_router(chatbot_router, prefix="/chatbot", tags=["chatbot"])
+
+
+@api_router.get("/health")
+async def health_check():
+    """Liveness probe. Cheap on purpose — load balancers poll it constantly."""
+    return {"status": "healthy", "version": "1.0.0"}
+</pre>
+</div>
+
+<p>
+  One aggregation point means <code>src/main.py</code> mounts a single router at
+  <code>settings.API_V1_STR</code>, and <code>/api/v2</code> later is a new module rather than a rewrite.
+  The <code>tags</code> are what group the endpoints in <code>/docs</code>.
+</p>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>Inline auth per route</td><td>One route ships unprotected; nobody notices for a month</td><td><code>Depends(get_current_*)</code></td></tr>
+    <tr><td>Distinct login error messages</td><td>Attackers enumerate valid emails from the login page</td><td>One message for both branches</td></tr>
+    <tr><td>Trusting a valid signature alone</td><td>Deleted accounts keep working for 30 days</td><td>Existence check after verification</td></tr>
+    <tr><td>One token for everything</td><td>A leaked chat token is a full account takeover</td><td>Separate user / session tokens</td></tr>
+    <tr><td>Blocking chat only</td><td>Users reload at 6s, doubling your LLM spend</td><td>SSE streaming endpoint</td></tr>
+    <tr><td>Raising inside the generator</td><td>Truncated body with a 200 status; client hangs</td><td>Error delivered as a final frame</td></tr>
+    <tr><td>No <code>done</code> sentinel</td><td>Client waits on a stream that already ended</td><td>Explicit <code>done: true</code> frame</td></tr>
+    <tr><td>Unversioned paths</td><td>Any breaking change breaks every client at once</td><td><code>/api/v1</code> prefix from day one</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const DI_CASES = {
+  ok: { steps: [
+      ["HTTPBearer()", "ok", "extracted 'eyJhbGciOiJIUzI1NiIs…'"],
+      ["sanitize_string(token)", "ok", "no change — token is base64url"],
+      ["verify_token(token)", "ok", "signature valid, exp in 29 days → sub = '8f3c…'"],
+      ["database_service.get_session()", "ok", "Session(id='8f3c…', user_id=42)"],
+      ["bind_context(...)", "ok", "user_id=42 session_id=8f3c… bound to logs"],
+      ["@limiter.limit('100 per minute')", "ok", "3/100 used this window"],
+      ["handler body runs", "ok", "agent.get_response(...)"]],
+    note: ["ok", "Clean path", "Six checks, and the handler body is three lines. Note the order: the cheap cryptographic check runs before the database round-trip, so a forged token never touches Postgres."] },
+  none: { steps: [
+      ["HTTPBearer()", "bad", "no Authorization header → HTTPException(403)"]],
+    note: ["danger", "Rejected at the first dependency", "FastAPI's <code>HTTPBearer</code> raises before any of your code runs. Nothing was queried, nothing was logged as a user action. This is the cheapest possible rejection — and it is free because the security scheme is declared, not implemented."] },
+  garbage: { steps: [
+      ["HTTPBearer()", "ok", "extracted 'abc.def'"],
+      ["sanitize_string(token)", "ok", "no change"],
+      ["verify_token(token)", "bad", "JWTError: Not enough segments → returns None"],
+      ["→ HTTPException(401)", "bad", "Invalid authentication credentials"]],
+    note: ["warn", "Malformed", "<code>verify_token</code> collapses every jose error into <code>None</code>. The caller learns nothing about <em>why</em> — which is correct: a detailed parse error is a hint to an attacker."] },
+  badsig: { steps: [
+      ["HTTPBearer()", "ok", "extracted a well-formed 3-segment token"],
+      ["verify_token(token)", "bad", "JWTError: Signature verification failed → None"],
+      ["→ HTTPException(401)", "bad", "Invalid authentication credentials"]],
+    note: ["danger", "Forged", "The payload claimed <code>sub: \"1\"</code>, but HMAC is computed over header+payload with <code>JWT_SECRET_KEY</code>. Editing one byte of the payload invalidates the signature. This is the attack the signature exists to stop — see the JWT workbench on <a href='03-security.html'>page 03</a>."] },
+  expired: { steps: [
+      ["HTTPBearer()", "ok", "extracted token"],
+      ["verify_token(token)", "bad", "JWTError: Signature has expired → None"],
+      ["→ HTTPException(401)", "bad", "Invalid authentication credentials"]],
+    note: ["warn", "Expired", "The <code>exp</code> claim is checked by jose, not by your code. With <code>JWT_ACCESS_TOKEN_EXPIRE_DAYS=30</code> this is rare — arguably too rare. A shorter access token plus a refresh token would shrink the window in which a stolen token stays useful."] },
+  deleted: { steps: [
+      ["HTTPBearer()", "ok", "extracted token"],
+      ["verify_token(token)", "ok", "signature valid → sub = '8f3c…'"],
+      ["database_service.get_session()", "bad", "returns None — row no longer exists"],
+      ["→ HTTPException(404)", "bad", "Session not found"]],
+    note: ["ok", "Why the DB lookup earns its keep", "The token is cryptographically perfect and still must be refused. Statelessness gets you out of a database call for <em>authenticity</em>, never for <em>existence</em>. Skipping this lookup is how deleted resources keep serving traffic."] },
+  usertoken: { steps: [
+      ["HTTPBearer()", "ok", "extracted a valid USER token"],
+      ["verify_token(token)", "ok", "signature valid → sub = '42'"],
+      ["database_service.get_session('42')", "bad", "no session with id '42' → None"],
+      ["→ HTTPException(404)", "bad", "Session not found"]],
+    note: ["warn", "Right key, wrong lock", "The token is genuine but its subject is a user id, and this dependency looks the subject up in the <em>session</em> table. Separation happens to hold because ids come from different namespaces (integers vs UUIDs). It holds by luck, not by construction — an explicit <code>typ</code> claim in the token would make it hold by design."] },
+  ratelimited: { steps: [
+      ["HTTPBearer()", "ok", "extracted token"],
+      ["verify_token(token)", "ok", "sub = '8f3c…'"],
+      ["database_service.get_session()", "ok", "Session loaded"],
+      ["@limiter.limit('100 per minute')", "bad", "101/100 → RateLimitExceeded"],
+      ["→ 429 Too Many Requests", "bad", "handled by _rate_limit_exceeded_handler"]],
+    note: ["warn", "Ordering costs you a query", "The limiter decorator sits outside the handler but the auth dependency resolves first, so a rate-limited request still paid for a database lookup. Moving rate limiting into middleware would reject it earlier and cheaper — a real consideration at the volumes on <a href='10-stress-testing.html'>page 10</a>."] },
+};
+
+function pageInit() {
+  /* ============ dependency resolver ============ */
+  function renderDi() {
+    const c = DI_CASES[document.getElementById("di-case").value];
+    document.getElementById("di-out").innerHTML =
+      '<span class="dim">POST /api/v1/chatbot/chat  →  resolving dependencies</span>\n\n' +
+      c.steps.map(([name, st, detail]) =>
+        `  ${st === "ok" ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} ${name.padEnd(34)} <span class="dim">${detail}</span>`
+      ).join("\n");
+    document.getElementById("di-note").innerHTML =
+      `<div class="note ${c.note[0] === "ok" ? "ok" : c.note[0]}"><span class="note-title">${c.note[1]}</span><p>${c.note[2]}</p></div>`;
+  }
+  document.getElementById("di-case").addEventListener("change", renderDi);
+  renderDi();
+
+  /* ============ SSE player ============ */
+  const ANSWER = "A connection pool keeps a fixed set of database connections open so each request skips the TCP and auth handshake entirely.".split(" ");
+  let timer = null;
+  function runStream() {
+    clearInterval(timer);
+    const ttft = Number(document.getElementById("s-ttft").value);
+    const rate = Number(document.getElementById("s-rate").value);
+    const crash = document.getElementById("s-crash").value === "1";
+    const perTok = 1000 / rate;
+    const crashAt = crash ? Math.floor(ANSWER.length * 0.45) : -1;
+    const totalMs = ttft + ANSWER.length * perTok;
+
+    const block = document.getElementById("s-block");
+    const stream = document.getElementById("s-stream");
+    const wire = document.getElementById("s-wire");
+    document.getElementById("s-b-ttfb").textContent = "waiting…";
+    document.getElementById("s-s-ttfb").textContent = ttft + " ms";
+    document.getElementById("s-total").textContent = (totalMs / 1000).toFixed(2) + " s";
+
+    wire.innerHTML = `<span class="dim">HTTP/1.1 200 OK
+content-type: text/event-stream
+cache-control: no-cache
+connection: keep-alive</span>
+
+`;
+    stream.innerHTML = '<span class="dim">connecting…</span>';
+    block.innerHTML = '<span class="dim">⏳ waiting for the full response…</span>';
+
+    let i = 0, started = performance.now(), text = "", frames = 0, stopped = false;
+    setTimeout(() => {
+      timer = setInterval(() => {
+        if (stopped) return;
+        if (i === crashAt) {
+          stopped = true; clearInterval(timer);
+          frames++;
+          wire.innerHTML += `<span class="bad">data: {"content": "Error: failed to get llm response after trying all models", "done": true}</span>\n\n`;
+          stream.innerHTML = text + '\n\n<span class="bad">▌ stream ended with an error frame</span>';
+          block.innerHTML = '<span class="bad">HTTP 500  {"detail": "failed to get llm response…"}</span>\n<span class="dim">the blocking client got a clean error status; the streaming client got a 200 with an error inside it</span>';
+          document.getElementById("s-frames").textContent = frames;
+          document.getElementById("s-b-ttfb").textContent = ((performance.now() - started) / 1000).toFixed(2) + " s";
+          document.getElementById("s-note").innerHTML =
+            "<strong>This is the asymmetry that matters.</strong> The blocking endpoint failed before any bytes were written, so FastAPI could still return a 500. The streaming endpoint had already sent <code>200 OK</code> and its headers — the only way left to tell the client is a <code>done: true</code> frame carrying the error text. A client that ignores frame contents and trusts the status code will silently show a half-finished answer as if it were complete.";
+          return;
+        }
+        if (i >= ANSWER.length) {
+          clearInterval(timer);
+          frames++;
+          wire.innerHTML += `<span class="ok">data: {"content": "", "done": true}</span>\n\n`;
+          stream.innerHTML = text + ' <span class="ok">✓</span>';
+          block.innerHTML = `<span class="ok">200 OK</span>  {"messages": [{"role": "assistant", "content": "${ANSWER.join(" ")}"}]}`;
+          document.getElementById("s-b-ttfb").textContent = (totalMs / 1000).toFixed(2) + " s";
+          document.getElementById("s-frames").textContent = frames;
+          document.getElementById("s-note").innerHTML =
+            `Both finished at <strong>${(totalMs / 1000).toFixed(2)}s</strong>. The streaming client had readable text after <strong>${ttft}ms</strong> — ${(totalMs / ttft).toFixed(1)}× sooner — across ${frames} frames. Nothing got faster; the wait just stopped being invisible.`;
+          return;
+        }
+        const tok = (i ? " " : "") + ANSWER[i];
+        text += tok; i++; frames++;
+        wire.innerHTML += `data: {"content": ${JSON.stringify(tok)}, "done": false}\n\n`;
+        wire.scrollTop = 1e6;
+        stream.innerHTML = text + ' <span class="hl">▌</span>';
+        document.getElementById("s-frames").textContent = frames;
+      }, perTok);
+    }, ttft);
+  }
+  bindRange("s-ttft", () => {});
+  bindRange("s-rate", () => {});
+  document.getElementById("s-go").addEventListener("click", runStream);
+  runStream();
+}
+</script>
+</body>
+</html>

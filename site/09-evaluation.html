@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 — Evaluation framework · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 09 · Operations</div>
+<h1>Evaluation framework</h1>
+<p class="lede">
+  Unit tests are deterministic; agents are not. The same prompt, the same input, a different answer — and a
+  system-prompt tweak that fixes one case quietly breaks five others. This layer grades real production traces
+  with an LLM judge and writes the scores back, so quality becomes a trend line instead of a vibe.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  You cannot <code>assert response == expected</code> against a generative model. But you also cannot ship
+  prompt changes on hope. What you <em>can</em> do is score a sample of real traffic against explicit rubrics
+  and watch the aggregate move.
+</p>
+<p>The framework here has four moving parts:</p>
+<ol>
+  <li>A <strong>structured output schema</strong> so the judge must produce a number and a justification.</li>
+  <li>A <strong>rubric per metric</strong>, stored as Markdown, discovered automatically.</li>
+  <li>An <strong>evaluator</strong> that pulls traces from Langfuse and grades them.</li>
+  <li>A <strong>CLI</strong> so it runs from a terminal or a cron job.</li>
+</ol>
+
+<h2 id="schema">Forcing the judge to show its work</h2>
+<div class="code" data-lang="python" data-file="evals/schemas.py">
+<pre>
+from pydantic import BaseModel, Field
+
+
+class ScoreSchema(BaseModel):
+    """Structured output for the LLM judge."""
+
+    score: float = Field(description="provide a score between 0 and 1")
+    reasoning: str = Field(description="provide a one sentence reasoning")
+</pre>
+</div>
+
+<p>Two fields, both load-bearing:</p>
+<ul>
+  <li><strong><code>score</code></strong> is aggregatable. "The response was pretty good" cannot be charted;
+    0.82 can.</li>
+  <li><strong><code>reasoning</code></strong> makes a bad grade auditable. When hallucination spikes on Tuesday
+    you need to read <em>why</em> the judge thought so — often the judge was wrong, and you have just learned
+    your rubric is ambiguous.</li>
+</ul>
+
+<div class="note">
+  <span class="note-title">Reasoning before score, not after</span>
+  <p>The rubrics all end with "Think step by step. Provide a reasoning before the score." Field order in the
+  schema matters for the same reason: a model that emits the number first has committed before it reasons,
+  and the reasoning becomes a post-hoc justification. Ordering the output so the argument precedes the verdict
+  measurably improves grading consistency.</p>
+</div>
+
+<h2 id="rubrics">Rubrics as content</h2>
+<p>
+  Five metrics ship in <code>evals/metrics/prompts/</code>. Each one is a Markdown file — no Python, no
+  redeploy to change a grading standard.
+</p>
+
+<div class="code" data-lang="bash" data-file="evals/metrics/prompts/">
+<pre>
+conciseness.md      # is it padded with filler?
+hallucination.md    # did it make things up?
+helpfulness.md      # would this actually help the user?
+relevancy.md        # did it answer the question that was asked?
+toxicity.md         # is it safe to send?
+</pre>
+</div>
+
+<div class="code" data-lang="bash" data-file="evals/metrics/prompts/hallucination.md">
+<pre>
+Evaluate the degree of hallucination in the generation on a continuous scale from 0 to 1.
+
+## Scoring Criteria
+A generation can be considered to hallucinate (Score: 1) if it:
+- Does not align with established knowledge
+- Contradicts verifiable data
+- Fails to follow logical inference
+- Includes elements that are implausible, misleading, or entirely fictional
+
+## Instructions
+Think step by step. Provide a reasoning before the score.
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">The polarity trap</span>
+  <p>For hallucination and toxicity, <strong>1 is bad</strong>. For relevancy, helpfulness and conciseness,
+  <strong>1 is good</strong>. Both directions are stored in the same <code>score</code> field with no polarity
+  flag, so a dashboard that averages all five metrics into one "quality score" produces a number that means
+  nothing. Chart them separately, or normalise the direction before aggregating.</p>
+</div>
+
+<p>The stronger rubrics include a worked example — a few-shot anchor that pins the scale:</p>
+
+<div class="code" data-lang="bash" data-file="evals/metrics/prompts/relevancy.md">
+<pre>
+Evaluate the relevancy of the generation on a continuous scale from 0 to 1.
+
+## Scoring Criteria
+A generation can be considered relevant (Score: 1) if it:
+- Directly addresses the user's specific question or request
+- Provides information that is pertinent to the query
+- Stays on topic without introducing unrelated information
+- Addresses all aspects of the query that require attention
+- Avoids tangential or off-topic discussions
+
+## Example
+
+### Input
+Can eating carrots improve your vision?
+
+### Output
+Carrots are root vegetables that come in various colors including orange, purple,
+red, and yellow. They were first cultivated in Afghanistan around 900 AD…
+
+### Evaluation
+**Score**: 0.3
+
+**Reasoning**: While the output provides factual information about carrots, it fails
+to address the specific question about whether carrots can improve vision…
+
+## Instructions
+Think step by step.
+</pre>
+</div>
+
+<p>Discovery is automatic — dropping a new <code>.md</code> file in the folder adds a metric:</p>
+
+<div class="code" data-lang="python" data-file="evals/metrics/__init__.py">
+<pre>
+import os
+
+metrics = []
+PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
+
+for file in os.listdir(PROMPTS_DIR):
+    if file.endswith(".md"):
+        metrics.append({
+            "name": file.replace(".md", ""),
+            "prompt": open(os.path.join(PROMPTS_DIR, file), "r").read(),
+        })
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Convenient, and slightly dangerous</span>
+  <p><code>os.listdir</code> returns entries in arbitrary order, so metric order is not stable across machines
+  — fine for a dict, confusing in a report. The file handles are never closed. And a stray
+  <code>notes.md</code> in that folder silently becomes a grading metric that runs against every trace, on
+  your budget. A <code>sorted(glob("*.md"))</code> with a context manager costs nothing and removes all three.</p>
+</div>
+
+<h2 id="toy-judge">Toy example: grade a response yourself</h2>
+<p>
+  Pick a conversation and a rubric, then see what the judge returns. These are pre-computed judgements
+  illustrating how each rubric responds to the same output — no network calls.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">LLM-as-a-judge</span>
+    <span class="widget-tag">ScoreSchema</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="j-case">trace to grade</label>
+        <select id="j-case">
+          <option value="good">a solid, direct answer</option>
+          <option value="halluc">a confident fabrication</option>
+          <option value="offtopic">accurate but answers a different question</option>
+          <option value="padded">correct, buried in filler</option>
+          <option value="refusal">an unhelpful non-answer</option>
+        </select>
+      </div>
+    </div>
+    <div class="out" id="j-io" style="margin-bottom:14px"></div>
+    <div id="j-scores"></div>
+    <div class="widget-note" id="j-note"></div>
+  </div>
+</div>
+
+<h2 id="evaluator">The evaluator</h2>
+<p>Fetch traces → for each trace, for each metric, call the judge → push the score back onto the trace.</p>
+
+<div class="code" data-lang="python" data-file="evals/evaluator.py">
+<pre>
+class Evaluator:
+    """Automated judge that grades real production interactions."""
+
+    def __init__(self):
+        self.client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        self.langfuse = Langfuse(public_key=settings.LANGFUSE_PUBLIC_KEY,
+                                 secret_key=settings.LANGFUSE_SECRET_KEY)
+
+    async def run(self, generate_report_file=True):
+        # 1. Real traffic, not a synthetic test set. This is the whole point:
+        #    you are measuring what users actually did.
+        traces = self.__fetch_traces()
+        logger.info(f"Found {len(traces)} traces to evaluate")
+
+        for trace in tqdm(traces, desc="Evaluating traces"):
+            input_text, output_text = get_input_output(trace)
+
+            # 2. Every metric against every trace
+            for metric in metrics:
+                score = await self._run_metric_evaluation(metric, input_text, output_text)
+                if score:
+                    # 3. Attach the grade to the trace it came from
+                    self._push_to_langfuse(trace, score, metric)
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="evals/evaluator.py">
+<pre>
+    async def _run_metric_evaluation(self, metric: dict, input: str,
+                                     output: str) -&gt; ScoreSchema | None:
+        try:
+            response = await self.client.beta.chat.completions.parse(
+                model="gpt-4o",              # judge with a STRONG model, always
+                messages=[
+                    {"role": "system", "content": metric["prompt"]},   # the rubric
+                    {"role": "user",
+                     "content": f"Input: {input}\nGeneration: {output}"},
+                ],
+                response_format=ScoreSchema,  # provider-enforced structured output
+            )
+            return response.choices[0].message.parsed
+        except Exception as e:
+            # One metric failing must not abandon the whole run
+            logger.error(f"Metric {metric['name']} failed", error=str(e))
+            return None
+
+    def _push_to_langfuse(self, trace: TraceWithDetails, score: ScoreSchema, metric: dict):
+        """Persist the grade so you can chart 'hallucination over 30 days'."""
+        self.langfuse.create_score(
+            trace_id=trace.id,
+            name=metric["name"],
+            value=score.score,
+            comment=score.reasoning,      # the audit trail
+        )
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Judge with a stronger model than you serve with</span>
+  <p>The agent runs <code>gpt-5-mini</code>; the judge runs <code>gpt-4o</code>. Grading is a harder task than
+  answering — it requires holding the rubric, the input and the output in mind simultaneously. Using the same
+  model to judge itself also imports its own blind spots: a model that hallucinated a fact will often fail to
+  notice that fact is wrong.</p>
+</div>
+
+<div class="note danger">
+  <span class="note-title">The cost multiplier nobody budgets for</span>
+  <p><strong>5 metrics × every trace × a frontier model.</strong> Grading is not free and it is not cheap —
+  evaluating every trace can cost more than serving the traffic did, since each judge call re-reads the whole
+  input and output. Sample. 200 traces a day at random gives you a trend line with tight enough confidence,
+  at 2% of the cost of grading everything.</p>
+</div>
+
+<div class="note warn">
+  <span class="note-title">The loop is sequential</span>
+  <p><code>for trace: for metric: await …</code> makes N×M round trips one at a time. With 500 traces and 5
+  metrics that is 2,500 sequential calls — hours. <code>asyncio.gather</code> with a semaphore would cut it to
+  minutes; the client is already async, so nothing but the loop shape is stopping it.</p>
+</div>
+
+<h2 id="toy-cost">Toy example: what a full evaluation run costs</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Eval run planner</span>
+    <span class="widget-tag">cost &amp; time</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="e-traces">traces per day <span class="val" id="e-traces-val"></span></label>
+        <input type="range" id="e-traces" min="50" max="5000" step="50" value="1200">
+      </div>
+      <div class="ctrl">
+        <label for="e-sample">sampling rate <span class="val" id="e-sample-val"></span></label>
+        <input type="range" id="e-sample" min="1" max="100" value="100" data-suffix="%">
+      </div>
+      <div class="ctrl">
+        <label for="e-metrics">metrics enabled <span class="val" id="e-metrics-val"></span></label>
+        <input type="range" id="e-metrics" min="1" max="5" value="5">
+      </div>
+      <div class="ctrl">
+        <label for="e-conc">concurrency <span class="val" id="e-conc-val"></span></label>
+        <input type="range" id="e-conc" min="1" max="30" value="1">
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">judge calls / day</div><div class="v" id="e-calls">—</div></div>
+      <div class="stat"><div class="k">wall clock</div><div class="v" id="e-time">—</div></div>
+      <div class="stat"><div class="k">cost / day</div><div class="v" id="e-cost">—</div></div>
+      <div class="stat"><div class="k">cost / month</div><div class="v" id="e-month">—</div></div>
+      <div class="stat"><div class="k">± on a 0.10 rate</div><div class="v" id="e-ci">—</div></div>
+    </div>
+    <div class="out" id="e-out"></div>
+    <div class="widget-note" id="e-note"></div>
+  </div>
+</div>
+
+<h2 id="cli">The entry point</h2>
+<div class="code" data-lang="python" data-file="evals/main.py">
+<pre>
+async def run_evaluation(generate_report: bool = True) -&gt; None:
+    """CLI command. Usage: python -m evals.main"""
+    print("Starting AI Evaluation...")
+    try:
+        evaluator = Evaluator()
+        await evaluator.run()
+        print("✅ Evaluation completed successfully.")
+    except Exception as e:
+        logger.error("Evaluation failed", error=str(e))
+        sys.exit(1)          # non-zero: a CI job or cron will notice
+
+
+if __name__ == "__main__":
+    asyncio.run(run_evaluation())
+</pre>
+</div>
+
+<p>
+  <code>evals/main.py</code> also ships an interactive mode (<code>make eval</code>), a quick mode over a
+  shorter trace window, and a report generator that aggregates per-metric averages into a summary — which is
+  what turns a pile of scores into something you can put in a pull request.
+</p>
+
+<h2 id="loop">The feedback loop this creates</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Regression detection</span>
+    <span class="widget-tag">30-day trend</span>
+  </div>
+  <div class="widget-body">
+    <div class="btn-row" style="margin-bottom:14px">
+      <button class="btn" id="t-step">Advance one day →</button>
+      <button class="btn ghost" id="t-reset">Reset</button>
+      <span class="dim mono" id="t-day" style="font-size:12px"></span>
+    </div>
+    <div id="t-chart"></div>
+    <div id="t-note" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="note">
+  <span class="note-title">This is the difference between a project and a platform</span>
+  <p>A prompt change ships on Tuesday. Wednesday's eval run scores the traces it produced. Thursday morning the
+  hallucination line has moved and you know which commit to look at — before enough users noticed to complain.
+  Without it, quality regressions are discovered by customers, and the cause is three weeks of commits ago.</p>
+</div>
+
+<h2 id="limits">What LLM-as-a-judge cannot do</h2>
+<ul>
+  <li><strong>It is not ground truth.</strong> The judge is another probabilistic model with its own biases —
+    notably a preference for longer, more confident-sounding answers. Calibrate it against human labels on a
+    small set before you trust the absolute numbers.</li>
+  <li><strong>Absolute scores drift; deltas hold.</strong> "Hallucination is 0.12" means little on its own.
+    "Hallucination went from 0.08 to 0.19 after Tuesday's deploy" is actionable. Never compare scores across
+    judge-model versions.</li>
+  <li><strong>It cannot see what the trace omits.</strong> Judging input and output alone misses whether the
+    <em>right tool</em> was called, whether retrieved memory was correct, or whether the answer was slow.
+    Those need their own checks.</li>
+  <li><strong>It does not replace tests.</strong> The deterministic parts of the system — auth, schemas,
+    routing, sanitisation — still deserve ordinary <code>pytest</code>. Do not let a fashionable eval suite
+    become an excuse for an untested API.</li>
+</ul>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>No evaluation</td><td>A prompt tweak degrades quality for three weeks unnoticed</td><td>Scheduled judging of real traces</td></tr>
+    <tr><td>Free-text grades</td><td>Nothing to chart, nothing to alert on</td><td><code>ScoreSchema</code> with a float</td></tr>
+    <tr><td>Score with no reasoning</td><td>A spike you cannot explain or trust</td><td><code>reasoning</code> pushed as the comment</td></tr>
+    <tr><td>Rubrics in code</td><td>Changing a standard needs a deploy</td><td>Markdown files, auto-discovered</td></tr>
+    <tr><td>Judging with the served model</td><td>The judge shares the agent's blind spots</td><td>A stronger model for grading</td></tr>
+    <tr><td>Grading a synthetic test set</td><td>Great scores, unhappy users</td><td>Grade production traces</td></tr>
+    <tr><td>Grading 100% of traffic</td><td>Evaluation costs more than inference</td><td>Sample, then widen the window</td></tr>
+    <tr><td>Averaging mixed polarity</td><td>A "quality score" that means nothing</td><td>Chart each metric separately</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const JUDGE_CASES = {
+  good: {
+    q: "Does pgvector support HNSW indexes?",
+    a: "Yes. HNSW support landed in pgvector 0.5.0, alongside the existing IVFFlat index. HNSW builds more slowly and uses more memory, but gives better recall-vs-speed than IVFFlat for most workloads.",
+    scores: { hallucination: [0.05, "Claims align with the documented pgvector release history; no fabricated details."],
+              relevancy: [0.95, "Directly answers the yes/no question and adds the trade-off the user would ask next."],
+              helpfulness: [0.9, "Actionable: names the version and the practical difference between the two index types."],
+              conciseness: [0.9, "Three sentences, no filler."],
+              toxicity: [0.0, "Neutral technical content."] },
+    note: "What a good trace looks like. Note that four metrics reward this and one (hallucination) rewards it by staying near zero — the polarity difference in one screen." },
+  halluc: {
+    q: "Does pgvector support HNSW indexes?",
+    a: "Yes. HNSW was introduced in pgvector 0.2.1 in 2019 and is enabled by default. It also ships a built-in reranker and automatic quantisation, so no tuning is needed.",
+    scores: { hallucination: [0.9, "Version and date are wrong, and the built-in reranker and automatic quantisation do not exist."],
+              relevancy: [0.85, "It does answer the question asked — relevance and truth are independent axes."],
+              helpfulness: [0.15, "Confidently misleading; a user acting on this would waste hours."],
+              conciseness: [0.85, "Compact — brevity is no defence against being wrong."],
+              toxicity: [0.0, "Nothing harmful in tone."] },
+    note: "<strong>The case that justifies the whole framework.</strong> Relevancy 0.85 and conciseness 0.85 — by those two metrics it looks like a fine answer. Only hallucination catches it. This is precisely why a single blended quality score is worse than useless: the good metrics would drown the one that mattered." },
+  offtopic: {
+    q: "Does pgvector support HNSW indexes?",
+    a: "Vector databases store high-dimensional embeddings and support similarity search. Popular options include Pinecone, Weaviate, Qdrant and Milvus, each with different hosting models and pricing.",
+    scores: { hallucination: [0.05, "Every statement is factually true."],
+              relevancy: [0.2, "Never addresses pgvector or HNSW; answers a broader question that was not asked."],
+              helpfulness: [0.2, "The user still does not know whether they can use HNSW."],
+              conciseness: [0.7, "Reasonably tight, but tight about the wrong subject."],
+              toxicity: [0.0, "Neutral."] },
+    note: "The mirror image of the previous case: perfectly truthful, almost entirely useless. Hallucination is 0.05 and the answer is still a failure. Truth and usefulness are different measurements — you need both." },
+  padded: {
+    q: "Does pgvector support HNSW indexes?",
+    a: "That's a great question, and I'm happy to help! Vector indexing is a fascinating area with a lot of nuance, and there are many factors to consider when choosing an approach. Broadly speaking, indexes trade build time against query performance. With all that said, and depending on your specific use case and requirements, yes — pgvector does support HNSW indexes.",
+    scores: { hallucination: [0.05, "The factual claim is correct."],
+              relevancy: [0.7, "Answers eventually, after substantial preamble."],
+              helpfulness: [0.55, "Correct but the answer is buried; a user skimming may miss it."],
+              conciseness: [0.15, "Roughly 80% of the tokens carry no information."],
+              toxicity: [0.0, "Polite to a fault."] },
+    note: "Conciseness catches the failure mode nothing else does. Padding is not just annoying — those tokens are billed on every turn, and they push real context out of the window when trimming kicks in (see <a href='03-security.html'>page 03</a>)." },
+  refusal: {
+    q: "Does pgvector support HNSW indexes?",
+    a: "I don't have enough information to answer that. You may want to consult the official documentation.",
+    scores: { hallucination: [0.0, "Makes no claims, so it cannot hallucinate."],
+              relevancy: [0.3, "Acknowledges the topic but does not address it."],
+              helpfulness: [0.1, "The user is exactly where they started."],
+              conciseness: [0.95, "Maximally brief."],
+              toxicity: [0.0, "Neutral."] },
+    note: "A perfect hallucination score and a perfect conciseness score for an answer that helps nobody. The system prompt instructs the agent to say it does not know rather than invent — correct policy, but if this pattern is common your retrieval or tools are the problem, not the prompt. Optimising on any single metric produces a degenerate agent." },
+};
+
+function pageInit() {
+  /* ============ judge ============ */
+  function jRender() {
+    const c = JUDGE_CASES[document.getElementById("j-case").value];
+    document.getElementById("j-io").innerHTML =
+      `<span class="dim">Input:     </span> ${c.q}\n<span class="dim">Generation:</span> ${c.a}`;
+    const rows = Object.entries(c.scores).map(([name, [v, why]]) => {
+      const inverted = name === "hallucination" || name === "toxicity";
+      const bad = inverted ? v > 0.4 : v < 0.5;
+      const mid = inverted ? v > 0.2 : v < 0.75;
+      const color = bad ? "var(--danger)" : mid ? "var(--warn)" : "var(--ok)";
+      return `<div style="margin-bottom:10px">
+        ${bar(name + (inverted ? " ↓" : " ↑"), v.toFixed(2), 1, color)}
+        <div style="font-size:12.5px;color:var(--text-faint);margin-left:140px">"${why}"</div>
+      </div>`;
+    }).join("");
+    document.getElementById("j-scores").innerHTML =
+      rows + `<div class="dim" style="font-size:12px;margin-top:6px">↑ higher is better &nbsp;·&nbsp; ↓ lower is better</div>`;
+    document.getElementById("j-note").innerHTML = c.note;
+  }
+  document.getElementById("j-case").addEventListener("change", jRender);
+  jRender();
+
+  /* ============ cost planner ============ */
+  function eRender() {
+    const traces = Number(document.getElementById("e-traces").value);
+    const sample = Number(document.getElementById("e-sample").value) / 100;
+    const nMetrics = Number(document.getElementById("e-metrics").value);
+    const conc = Number(document.getElementById("e-conc").value);
+
+    const graded = Math.round(traces * sample);
+    const calls = graded * nMetrics;
+    // ~1400 in / 90 out tokens per judge call at gpt-4o pricing
+    const cost = calls * (1400 * 2.5 / 1e6 + 90 * 10 / 1e6);
+    const seconds = calls * 2.6 / conc;
+
+    document.getElementById("e-calls").textContent = calls.toLocaleString();
+    document.getElementById("e-cost").textContent = "$" + cost.toFixed(2);
+    document.getElementById("e-month").textContent = "$" + (cost * 30).toFixed(0);
+    const t = document.getElementById("e-time");
+    t.textContent = seconds > 3600 ? (seconds / 3600).toFixed(1) + " h" : seconds > 60 ? (seconds / 60).toFixed(0) + " min" : seconds.toFixed(0) + " s";
+    t.className = "v " + (seconds > 3600 ? "bad" : seconds > 600 ? "warn" : "good");
+
+    // 95% CI half-width for p=0.10 at n=graded
+    const ci = graded > 0 ? 1.96 * Math.sqrt(0.1 * 0.9 / graded) : 1;
+    const ciEl = document.getElementById("e-ci");
+    ciEl.textContent = "±" + (ci * 100).toFixed(1) + " pp";
+    ciEl.className = "v " + (ci > 0.05 ? "bad" : ci > 0.03 ? "warn" : "good");
+
+    document.getElementById("e-out").innerHTML =
+`<span class="dim">grading ${graded.toLocaleString()} of ${traces.toLocaleString()} traces × ${nMetrics} metric(s)</span>
+<span class="dim">judge model: gpt-4o · ~1400 input + 90 output tokens per call</span>
+<span class="dim">concurrency: ${conc}${conc === 1 ? "  (as written — a plain sequential for-loop)" : "  (asyncio.gather with a semaphore)"}</span>`;
+
+    const notes = [];
+    if (conc === 1 && seconds > 3600) notes.push(`<strong style="color:var(--danger)">${(seconds / 3600).toFixed(1)} hours sequentially.</strong> A nightly cron would still be running at lunchtime. Raise concurrency — the client is already async.`);
+    if (sample === 1 && traces > 1000) notes.push(`Grading <strong>100%</strong> of traffic at $${(cost * 30).toFixed(0)}/month. The confidence interval barely improves past a few hundred samples: drop to 20% and you keep a ±${(1.96 * Math.sqrt(0.1 * 0.9 / (traces * 0.2)) * 100).toFixed(1)}pp trend line for a fifth of the price.`);
+    if (ci > 0.05) notes.push(`<strong style="color:var(--warn)">±${(ci * 100).toFixed(1)} percentage points</strong> is too wide to detect a real regression — a hallucination rate moving 0.10 → 0.14 would be indistinguishable from noise. Sample more traces.`);
+    if (!notes.length) notes.push(`Reasonable envelope: ${calls.toLocaleString()} calls, ${t.textContent}, $${(cost * 30).toFixed(0)}/month, and a confidence interval tight enough to spot a genuine shift.`);
+    document.getElementById("e-note").innerHTML = notes.join(" ");
+  }
+  ["e-traces", "e-sample", "e-metrics", "e-conc"].forEach(id => bindRange(id, eRender));
+  eRender();
+
+  /* ============ trend ============ */
+  const SERIES = [];
+  for (let d = 0; d < 14; d++) {
+    // deploy on day 8 causes a hallucination regression
+    const base = d < 8 ? 0.08 : 0.21;
+    SERIES.push({
+      day: d + 1,
+      halluc: Math.max(0.02, base + (((d * 37) % 11) - 5) / 180),
+      helpful: d < 8 ? 0.86 + (((d * 53) % 7) - 3) / 200 : 0.79 + (((d * 53) % 7) - 3) / 200,
+      deploy: d === 7,
+    });
+  }
+  let tDay = 0;
+  function tRender() {
+    const rows = SERIES.slice(0, tDay);
+    document.getElementById("t-day").textContent = tDay ? `day ${tDay} / 14` : "";
+    document.getElementById("t-chart").innerHTML = rows.length
+      ? rows.map(r => {
+          const flag = r.deploy ? ' <span class="warnc">← prompt change deployed</span>' : "";
+          return `<div class="bar-row"><span class="bar-label">day ${String(r.day).padStart(2)}</span>
+            <span class="bar-track"><span class="bar-fill" style="width:${r.halluc * 100 * 3}%;background:${r.halluc > 0.15 ? "var(--danger)" : "var(--ok)"}"></span></span>
+            <span class="bar-val">${r.halluc.toFixed(2)}</span><span style="font-size:12px">${flag}</span></div>`;
+        }).join("")
+      : '<div class="out"><span class="dim">Press “Advance one day” to accumulate nightly eval runs.</span></div>';
+
+    const el = document.getElementById("t-note");
+    if (tDay === 0) el.innerHTML = `<div class="note"><p>Each bar is one nightly <code>python -m evals.main</code> run: the mean hallucination score across that day's sampled traces.</p></div>`;
+    else if (tDay < 8) el.innerHTML = `<div class="note ok"><span class="note-title">Baseline</span><p>Hovering around 0.08. You need this history <em>before</em> the incident — without a baseline, day 9's number is just a number.</p></div>`;
+    else if (tDay === 8) el.innerHTML = `<div class="note warn"><span class="note-title">Deploy day</span><p>A system-prompt change shipped. Today's traces were mostly generated before it went out, so the score barely moves. <strong>This is why same-day validation misleads.</strong></p></div>`;
+    else if (tDay === 9) el.innerHTML = `<div class="note danger"><span class="note-title">The signal</span><p>0.08 → 0.21 overnight, on the first full day of traffic under the new prompt. One commit to look at, one revert to make. The <code>reasoning</code> comments on the low-scoring traces tell you which instruction the model started over-applying.</p></div>`;
+    else el.innerHTML = `<div class="note danger"><span class="note-title">Day ${tDay}: still elevated</span><p>The regression is stable, not noise. Every day it stays up is a day of degraded answers — and without this chart, nobody would know until support tickets accumulated enough to notice a pattern.</p></div>`;
+    document.getElementById("t-step").disabled = tDay >= SERIES.length;
+  }
+  document.getElementById("t-step").addEventListener("click", () => { tDay = Math.min(tDay + 1, SERIES.length); tRender(); });
+  document.getElementById("t-reset").addEventListener("click", () => { tDay = 0; tRender(); document.getElementById("t-step").disabled = false; });
+  tRender();
+}
+</script>
+</body>
+</html>

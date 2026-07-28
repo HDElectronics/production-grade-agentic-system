@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 — DevOps automation · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 08 · Operations</div>
+<h1>DevOps automation</h1>
+<p class="lede">
+  How the thing gets built, how it refuses to start when misconfigured, how its dashboards exist without
+  anyone clicking, and how a push to <code>master</code> becomes an image. Three questions:
+  <em>how do we deploy it, how do we watch it, how do we know the environment is ready.</em>
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="dockerfile">The Dockerfile</h2>
+<div class="code" data-lang="bash" data-file="Dockerfile">
+<pre>
+FROM python:3.13.2-slim
+
+WORKDIR /app
+
+ARG APP_ENV=production
+
+ENV APP_ENV=${APP_ENV} \
+    PYTHONFAULTHANDLER=1 \        # dump a traceback on a hard crash / SIGSEGV
+    PYTHONUNBUFFERED=1 \          # don't buffer stdout — logs appear in real time
+    PYTHONHASHSEED=random \       # per-process hash randomisation
+    PIP_NO_CACHE_DIR=1 \          # no wheel cache = smaller image
+    PIP_DISABLE_PIP_VERSION_CHECK=on \
+    PIP_DEFAULT_TIMEOUT=100
+
+# libpq-dev + build-essential are needed to compile psycopg2.
+# Chained into one RUN so the apt lists deletion lands in the SAME layer —
+# a separate RUN rm would leave the lists in the previous layer forever.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    && pip install --upgrade pip \
+    && pip install uv \
+    && rm -rf /var/lib/apt/lists/*
+
+# THE CACHE TRICK: dependency manifest first, source code later.
+COPY pyproject.toml .
+RUN uv venv && . .venv/bin/activate && uv pip install -e .
+
+COPY . .                                     # source changes invalidate only from here
+
+RUN chmod +x /app/scripts/docker-entrypoint.sh
+
+# Root inside a container is root on the host if anything escapes.
+RUN useradd -m appuser && chown -R appuser:appuser /app
+USER appuser
+
+RUN mkdir -p /app/logs
+EXPOSE 8000
+
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]   # always runs — the gatekeeper
+CMD ["/app/.venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">ENTRYPOINT vs CMD</span>
+  <p><code>ENTRYPOINT</code> is the program; <code>CMD</code> is its default arguments. Running
+  <code>docker run image bash</code> replaces the CMD but the entrypoint still executes — so the secret
+  validation below cannot be skipped by passing a different command. That is exactly why the check lives
+  there rather than in Python.</p>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Two things worth fixing before this is genuinely production-grade</span>
+  <p><strong>Not multi-stage.</strong> <code>build-essential</code> stays in the final image — hundreds of
+  megabytes of compiler shipped to production and a wider attack surface. A builder stage that copies only
+  <code>.venv</code> forward would cut the image substantially.
+  <strong>No HEALTHCHECK instruction.</strong> The compose file defines one, so plain <code>docker run</code>
+  has no health signal at all.</p>
+</div>
+
+<h2 id="toy-cache">Toy example: Docker layer caching</h2>
+<p>
+  The <code>COPY pyproject.toml</code> / <code>COPY . .</code> split is the difference between a 4-second
+  rebuild and a 3-minute one. Pick what changed and see which layers survive.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Layer cache simulator</span>
+    <span class="widget-tag">docker build</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="d-change">what changed since the last build</label>
+        <select id="d-change">
+          <option value="src">a line in src/agent/workflow.py</option>
+          <option value="dep">a dependency in pyproject.toml</option>
+          <option value="none">nothing</option>
+          <option value="base">the base image tag</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="d-order">Dockerfile layout</label>
+        <select id="d-order">
+          <option value="good">manifest first, then source  (as written)</option>
+          <option value="bad">COPY . . before installing deps</option>
+        </select>
+      </div>
+    </div>
+    <div class="out" id="d-out"></div>
+    <div class="stats" style="margin-top:12px">
+      <div class="stat"><div class="k">layers rebuilt</div><div class="v" id="d-n">0</div></div>
+      <div class="stat"><div class="k">build time</div><div class="v" id="d-time">0s</div></div>
+      <div class="stat"><div class="k">vs. cold build</div><div class="v good" id="d-saved">—</div></div>
+    </div>
+    <div class="widget-note" id="d-note"></div>
+  </div>
+</div>
+
+<h2 id="entrypoint">Fail fast on missing secrets</h2>
+<p>
+  The worst deployment failure is the one that half-works: the container starts, serves <code>/health</code>,
+  and 500s on every real request because <code>OPENAI_API_KEY</code> was empty. The entrypoint refuses to
+  start rather than start broken.
+</p>
+
+<div class="code" data-lang="bash" data-file="scripts/docker-entrypoint.sh">
+<pre>
+#!/bin/bash
+set -e                       # abort on any error — no silent partial startup
+
+# Runtime secret injection: the .env file is mounted, not baked into the image
+if [ -f ".env.${APP_ENV}" ]; then
+    echo "Loading environment from .env.${APP_ENV}"
+    # (source the file …)
+fi
+
+# Fail fast on anything the app cannot run without
+required_vars=("JWT_SECRET_KEY" "OPENAI_API_KEY")
+missing_vars=()
+
+for var in "${required_vars[@]}"; do
+    if [[ -z "${!var}" ]]; then          # ${!var} = indirect expansion
+        missing_vars+=("$var")
+    fi
+done
+
+if [[ ${#missing_vars[@]} -gt 0 ]]; then
+    echo "ERROR: The following required environment variables are missing:"
+    for var in "${missing_vars[@]}"; do
+        echo "  - $var"
+    done
+    exit 1                    # container exits non-zero: the orchestrator sees it
+fi
+
+exec "$@"                     # hand off to CMD, replacing this shell as PID 1
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title"><code>exec "$@"</code> is doing more than it looks</span>
+  <p>Without <code>exec</code>, bash stays PID 1 and uvicorn becomes its child — so
+  <code>docker stop</code>'s SIGTERM goes to bash, which does not forward it, and Docker kills the container
+  after the 10-second grace period. In-flight streams get severed and the lifespan shutdown never runs, so
+  <code>langfuse.flush()</code> is skipped. <code>exec</code> replaces the shell, uvicorn becomes PID 1, and
+  graceful shutdown works.</p>
+</div>
+
+<h2 id="toy-entrypoint">Toy example: the gatekeeper</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Entrypoint secret check</span>
+    <span class="widget-tag">fail fast</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label>environment variables set</label>
+        <div style="display:flex;flex-direction:column;gap:2px;font-size:12.5px" class="mono">
+          <label><input type="checkbox" class="ep" data-v="JWT_SECRET_KEY" checked> JWT_SECRET_KEY</label>
+          <label><input type="checkbox" class="ep" data-v="OPENAI_API_KEY" checked> OPENAI_API_KEY</label>
+          <label><input type="checkbox" class="ep" data-v="POSTGRES_PASSWORD" checked> POSTGRES_PASSWORD <span class="dim">(not checked!)</span></label>
+        </div>
+      </div>
+      <div class="ctrl">
+        <label for="ep-env">APP_ENV</label>
+        <select id="ep-env"><option>production</option><option>development</option></select>
+      </div>
+    </div>
+    <div class="out" id="ep-out"></div>
+    <div class="widget-note" id="ep-note"></div>
+  </div>
+</div>
+
+<h2 id="monitoring">Monitoring configuration</h2>
+<div class="code" data-lang="yaml" data-file="prometheus/prometheus.yml">
+<pre>
+global:
+  scrape_interval: 15s        # resolution of every chart you will ever draw
+
+scrape_configs:
+  - job_name: 'fastapi'
+    metrics_path: '/metrics'
+    scheme: 'http'
+    static_configs:
+      - targets: ['app:8000']       # docker-compose service name, not localhost
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+</pre>
+</div>
+
+<p>
+  Prometheus <em>pulls</em>. That means it also knows when a target stops answering — the synthetic
+  <code>up</code> metric goes to 0 — so "the app is down" is a query, not a missing signal. A push-based
+  system cannot tell silence from health.
+</p>
+
+<div class="code" data-lang="yaml" data-file="grafana/dashboards/dashboards.yml">
+<pre>
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json   # mounted from ./grafana
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Dashboards as code</span>
+  <p>The JSON in <code>grafana/dashboards/json/</code> is version-controlled, so a fresh Grafana container comes
+  up with your charts already there. The tension: <code>editable: true</code> lets people tweak in the UI, and
+  those tweaks are lost on the next container restart. Either export back to the repo after editing, or set
+  <code>editable: false</code> and make the repo the only path.</p>
+</div>
+
+<h2 id="makefile">The Makefile as an interface</h2>
+<p>
+  Nobody should have to remember <code>APP_ENV=production docker-compose --env-file .env.production up -d --build db app</code>.
+  The Makefile is the contract between the codebase and the humans operating it.
+</p>
+
+<div class="code" data-lang="bash" data-file="Makefile">
+<pre>
+install:
+	pip install uv
+	uv sync
+
+# Local development with hot reload on uvloop
+dev:
+	@echo "Starting server in development environment"
+	@bash -c "source scripts/set_env.sh development && \
+	  uv run uvicorn app.main:app --reload --port 8000 --loop uvloop"
+
+# Full stack in Docker, environment-parameterised
+docker-run-env:
+	@if [ -z "$(ENV)" ]; then \
+	  echo "ENV is not set. Usage: make docker-run-env ENV=development"; \
+	  exit 1; \
+	fi
+	@ENV_FILE=.env.$(ENV); \
+	APP_ENV=$(ENV) docker-compose --env-file $$ENV_FILE up -d --build db app
+
+# Run the LLM-as-a-judge evaluation suite
+eval:
+	@echo "Running evaluation with interactive mode"
+	@bash -c "source scripts/set_env.sh ${ENV:-development} && \
+	  python -m evals.main --interactive"
+</pre>
+</div>
+
+<p>The full target list in this repository:</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Makefile target explorer</span>
+    <span class="widget-tag">click a target</span>
+  </div>
+  <div class="widget-body">
+    <div class="flow" id="mk-nodes" style="justify-content:flex-start"></div>
+    <div id="mk-detail"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-title">The <code>ENV</code> guard is not decoration</span>
+  <p>Without <code>if [ -z "$(ENV)" ]</code>, running <code>make docker-run-env</code> bare would expand to
+  <code>--env-file .env.</code> — a file that does not exist — and compose would start with an empty
+  environment. Every secret blank, the app crash-looping, and a confusing error three layers down. Guarding
+  required variables in the target is a one-line fix for a ten-minute debugging session.</p>
+</div>
+
+<h2 id="ci">Continuous delivery</h2>
+<div class="code" data-lang="yaml" data-file=".github/workflows/deploy.yaml">
+<pre>
+name: Build and push to Docker Hub
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-and-push:
+    name: Build and push to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Build Image
+        run: |
+          make docker-build-env ENV=production          # same Makefile as local
+          docker tag fastapi-langgraph-template:production \
+            ${{ secrets.DOCKER_USERNAME }}/my-agent:production
+
+      - name: Log in to Docker Hub
+        run: |
+          echo ${{ secrets.DOCKER_PASSWORD }} | \
+            docker login --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Push Image
+        run: docker push ${{ secrets.DOCKER_USERNAME }}/my-agent:production
+</pre>
+</div>
+
+<p>
+  CI calling <code>make docker-build-env</code> — the same target a developer runs locally — is the detail that
+  matters. When the build is defined once, "works locally, fails in CI" becomes a much smaller category of bug.
+</p>
+
+<div class="note danger">
+  <span class="note-title">Three gaps in this pipeline</span>
+  <p><strong>No tests run before the push.</strong> A commit that fails <code>pytest</code> still ships an image.
+  <strong>Only the <code>:production</code> tag.</strong> Every build overwrites it, so there is no immutable
+  reference to roll back to — tag with the commit SHA as well.
+  <strong>A long-lived Docker Hub password in secrets.</strong> OIDC federation or a scoped access token limits
+  the damage if the repository is compromised.</p>
+</div>
+
+<h2 id="toy-pipeline">Toy example: what a bad push costs</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">CI pipeline walkthrough</span>
+    <span class="widget-tag">push to master</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="ci-case">the commit being pushed</label>
+        <select id="ci-case">
+          <option value="ok">a clean change</option>
+          <option value="broken">breaks a test (no test step exists)</option>
+          <option value="secret">a syntax error in main.py</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="ci-tests">add a test step to the workflow</label>
+        <select id="ci-tests"><option value="0">no (as written)</option><option value="1">yes</option></select>
+      </div>
+    </div>
+    <div class="out" id="ci-out"></div>
+    <div id="ci-note" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>Source copied before deps</td><td>Every one-line change rebuilds the whole dependency tree</td><td><code>COPY pyproject.toml</code> first</td></tr>
+    <tr><td>Running as root</td><td>A container escape is a host root escape</td><td><code>useradd appuser</code> + <code>USER</code></td></tr>
+    <tr><td>No <code>PYTHONUNBUFFERED</code></td><td>Logs appear minutes late, or never on a crash</td><td>Set it in <code>ENV</code></td></tr>
+    <tr><td>No secret validation</td><td>Container starts, then 500s on every real request</td><td>Entrypoint <code>required_vars</code> check</td></tr>
+    <tr><td>No <code>exec "$@"</code></td><td>SIGTERM ignored; streams severed on deploy</td><td><code>exec</code> so uvicorn is PID 1</td></tr>
+    <tr><td>Manual dashboards</td><td>Rebuilt from memory after every incident</td><td>Provisioned from JSON in the repo</td></tr>
+    <tr><td>Raw compose commands</td><td>Someone deploys with the wrong <code>--env-file</code></td><td>Makefile targets with guards</td></tr>
+    <tr><td>Mutable image tags only</td><td>No way to roll back to yesterday's build</td><td>Tag with the commit SHA</td></tr>
+    <tr><td>No tests in CI</td><td>A red build still ships to Docker Hub</td><td>Add a test step before the push</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const LAYERS = [
+  { n: "FROM python:3.13.2-slim", t: 3, inv: ["base"] },
+  { n: "WORKDIR + ENV", t: 0, inv: ["base"] },
+  { n: "RUN apt-get install build-essential libpq-dev", t: 48, inv: ["base"] },
+  { n: "COPY pyproject.toml .", t: 0, inv: ["base", "dep"] },
+  { n: "RUN uv venv && uv pip install -e .", t: 96, inv: ["base", "dep"] },
+  { n: "COPY . .", t: 1, inv: ["base", "dep", "src"] },
+  { n: "RUN chmod +x entrypoint.sh", t: 1, inv: ["base", "dep", "src"] },
+  { n: "RUN useradd appuser && chown -R", t: 6, inv: ["base", "dep", "src"] },
+];
+const LAYERS_BAD = [
+  { n: "FROM python:3.13.2-slim", t: 3, inv: ["base"] },
+  { n: "WORKDIR + ENV", t: 0, inv: ["base"] },
+  { n: "RUN apt-get install build-essential libpq-dev", t: 48, inv: ["base"] },
+  { n: "COPY . .", t: 1, inv: ["base", "dep", "src"] },
+  { n: "RUN uv venv && uv pip install -e .", t: 96, inv: ["base", "dep", "src"] },
+  { n: "RUN chmod +x entrypoint.sh", t: 1, inv: ["base", "dep", "src"] },
+  { n: "RUN useradd appuser && chown -R", t: 6, inv: ["base", "dep", "src"] },
+];
+
+const MAKE_TARGETS = {
+  install: ["install", "<code>pip install uv &amp;&amp; uv sync</code> — resolves the lockfile into a virtualenv. The first command anyone runs on a fresh clone."],
+  dev: ["dev", "Runs uvicorn locally with <code>--reload</code> and <code>--loop uvloop</code> after sourcing <code>scripts/set_env.sh development</code>. Hot reload without Docker, for the fast inner loop."],
+  "set-env": ["set-env", "Copies <code>.env.example</code> into <code>.env.&lt;environment&gt;</code>. The one-time bootstrap step before anything else works."],
+  "prod / staging / dev": ["prod · staging · dev", "Environment shortcuts that export <code>APP_ENV</code> and start the server with the matching settings profile — the profile that drives <code>apply_environment_settings()</code> from <a href='01-modular-codebase.html'>page 01</a>."],
+  eval: ["eval · eval-quick · eval-no-report", "Runs the LLM-as-a-judge suite from <a href='09-evaluation.html'>page 09</a>. <code>eval-quick</code> trims the trace window; <code>eval-no-report</code> skips report generation for CI use."],
+  "lint / format": ["lint · format", "ruff / flake8 and black / isort over the tree, using the configuration declared in <code>pyproject.toml</code>. Same tools locally and in review."],
+  "docker-build-env": ["docker-build-env", "Builds the image for a named ENV. <strong>This is the target CI calls</strong>, so the image built on a laptop and the image built by GitHub Actions come off the same recipe."],
+  "docker-run-env": ["docker-run-env", "<code>docker-compose --env-file .env.$(ENV) up -d --build db app</code>. Guards on <code>ENV</code> being set. The everyday \"bring the stack up\" command."],
+  "docker-logs / docker-stop": ["docker-logs · docker-stop", "Wrappers over compose logs and teardown so nobody has to remember container names or the project prefix."],
+  "docker-compose-up/down/logs": ["docker-compose-*", "Full-stack variants that include Prometheus, Grafana and cAdvisor, not just the database and app."],
+  clean: ["clean", "Removes <code>__pycache__</code>, build artifacts and stale virtualenv state — the first thing to try when the environment starts behaving impossibly."],
+  help: ["help", "Prints every target with its description. Make it the default goal and the Makefile documents itself."],
+};
+
+function pageInit() {
+  /* ============ docker cache ============ */
+  function dRender() {
+    const change = document.getElementById("d-change").value;
+    const good = document.getElementById("d-order").value === "good";
+    const layers = good ? LAYERS : LAYERS_BAD;
+    let invalidated = false, total = 0, rebuilt = 0;
+    const lines = layers.map(l => {
+      if (change !== "none" && l.inv.includes(change)) invalidated = true;
+      if (invalidated) { total += l.t; rebuilt++; return `  <span class="warnc">RUN  </span> ${l.n}  <span class="dim">${l.t}s</span>`; }
+      return `  <span class="ok">CACHED</span> ${l.n}`;
+    });
+    const cold = layers.reduce((s, l) => s + l.t, 0);
+    document.getElementById("d-out").innerHTML =
+      `<span class="dim">$ docker build -t agent:production .</span>\n\n` + lines.join("\n");
+    document.getElementById("d-n").textContent = `${rebuilt}/${layers.length}`;
+    document.getElementById("d-time").textContent = total + "s";
+    const saved = cold - total;
+    const sv = document.getElementById("d-saved");
+    sv.textContent = saved > 0 ? "−" + saved + "s" : "no saving";
+    sv.className = "v " + (saved > 60 ? "good" : saved > 0 ? "warn" : "bad");
+
+    let note;
+    if (change === "none") note = "Nothing changed, so every layer is served from cache. This is the no-op build — it should be near-instant, and if it isn't, something in your Dockerfile is non-deterministic.";
+    else if (change === "base") note = "A base image change invalidates literally everything below it. Unavoidable, and the reason to pin a specific tag rather than <code>:latest</code> — with <code>:latest</code> this happens at random.";
+    else if (change === "dep" ) note = good
+      ? "A dependency change invalidates <code>COPY pyproject.toml</code> and everything after it. Correct and unavoidable — you genuinely need to reinstall."
+      : "Same cost either way here. Dependency changes always trigger a reinstall; the layout only matters for source-only changes.";
+    else note = good
+      ? `<strong>This is the payoff.</strong> A source-only change starts invalidating at <code>COPY . .</code>, so the 96-second dependency install stays cached. ${total}s instead of ${cold}s — repeated dozens of times a day across a team.`
+      : `<strong>The expensive mistake.</strong> Because <code>COPY . .</code> sits above the install, a one-character source change reinstalls every dependency. ${total}s for a build that should take ${LAYERS.filter((l,i)=>i>=5).reduce((s,l)=>s+l.t,0)}s. Switch the layout to see the difference.`;
+    document.getElementById("d-note").innerHTML = note;
+  }
+  document.getElementById("d-change").addEventListener("change", dRender);
+  document.getElementById("d-order").addEventListener("change", dRender);
+  dRender();
+
+  /* ============ entrypoint ============ */
+  function epRender() {
+    const set = new Set($$(".ep").filter(c => c.checked).map(c => c.dataset.v));
+    const env = document.getElementById("ep-env").value;
+    const required = ["JWT_SECRET_KEY", "OPENAI_API_KEY"];
+    const missing = required.filter(v => !set.has(v));
+    let out = `<span class="dim">$ docker run agent:production</span>\n\nLoading environment from .env.${env}\n`;
+    if (missing.length) {
+      out += `\n<span class="bad">ERROR: The following required environment variables are missing:</span>\n`;
+      missing.forEach(v => out += `<span class="bad">  - ${v}</span>\n`);
+      out += `\n<span class="dim">exit 1</span>\n<span class="dim">container exited with code 1 — restart: on-failure will retry, then give up</span>`;
+      document.getElementById("ep-note").innerHTML =
+        `The container never reaches uvicorn. Your orchestrator reports a crash-loop with the exact missing variable in the logs — a 30-second fix. Compare that with starting successfully and returning <code>AuthenticationError</code> on every chat request, which looks like an LLM problem for the first twenty minutes.`;
+    } else if (!set.has("POSTGRES_PASSWORD")) {
+      out += `\n<span class="ok">all required variables present → exec uvicorn</span>\n`;
+      out += `<span class="dim">INFO  application_startup project_name=… version=1.0.0</span>\n`;
+      out += `<span class="bad">ERROR database_initialization_failed error='fe_sendauth: no password supplied'</span>\n`;
+      out += `<span class="dim">GET /health → 503 {"status": "degraded", "database": "unhealthy"}</span>`;
+      document.getElementById("ep-note").innerHTML =
+        `<strong>The gap in the check.</strong> <code>POSTGRES_PASSWORD</code> is not in <code>required_vars</code>, so the container starts happily and fails at the first query instead. The healthcheck catches it — that is the safety net working — but the entrypoint should have caught it a second earlier. Every variable the app cannot run without belongs in that list.`;
+    } else {
+      out += `\n<span class="ok">all required variables present → exec uvicorn</span>\n`;
+      out += `<span class="dim">INFO  application_startup project_name=… environment=${env}</span>\n`;
+      out += `<span class="dim">INFO  database_initialized pool_size=5</span>\n`;
+      out += `<span class="ok">INFO  Uvicorn running on http://0.0.0.0:8000</span>`;
+      document.getElementById("ep-note").innerHTML =
+        `Clean start. Note that <code>exec</code> replaced the shell, so uvicorn is PID 1 and will receive SIGTERM directly on <code>docker stop</code> — which is what lets the lifespan shutdown flush Langfuse before the process dies.`;
+    }
+    document.getElementById("ep-out").innerHTML = out;
+  }
+  $$(".ep").forEach(c => c.addEventListener("change", epRender));
+  document.getElementById("ep-env").addEventListener("change", epRender);
+  epRender();
+
+  /* ============ makefile ============ */
+  const keys = Object.keys(MAKE_TARGETS);
+  document.getElementById("mk-nodes").innerHTML = keys.map(k =>
+    `<span class="node" data-k="${k}" style="cursor:pointer;font-size:11.5px;padding:6px 11px">${k}</span>`).join("");
+  function mkPick(k) {
+    $$("#mk-nodes .node").forEach(n => n.classList.toggle("active", n.dataset.k === k));
+    document.getElementById("mk-detail").innerHTML =
+      `<h3 style="margin-top:4px">make ${MAKE_TARGETS[k][0]}</h3><p style="margin-bottom:0">${MAKE_TARGETS[k][1]}</p>`;
+  }
+  $$("#mk-nodes .node").forEach(n => n.addEventListener("click", () => mkPick(n.dataset.k)));
+  mkPick("docker-run-env");
+
+  /* ============ CI ============ */
+  function ciRender() {
+    const c = document.getElementById("ci-case").value;
+    const tests = document.getElementById("ci-tests").value === "1";
+    const L = [];
+    L.push('<span class="dim">push → master · workflow "Build and push to Docker Hub"</span>\n');
+    L.push('  <span class="ok">✓</span> Checkout code                 <span class="dim">actions/checkout@v3</span>');
+    if (tests) {
+      if (c === "broken") {
+        L.push('  <span class="bad">✗</span> Run tests                     <span class="bad">1 failed, 42 passed</span>');
+        L.push('\n<span class="bad">workflow failed — nothing was pushed</span>');
+        L.push('<span class="dim">production still runs yesterday\'s image</span>');
+        document.getElementById("ci-note").innerHTML =
+          `<div class="note ok"><span class="note-title">Caught</span><p>The regression stopped at CI. This is the single highest-value line you can add to this workflow — a <code>pytest</code> step before the build, with the job failing on a non-zero exit.</p></div>`;
+        document.getElementById("ci-out").innerHTML = L.join("\n"); return;
+      }
+      L.push('  <span class="ok">✓</span> Run tests                     <span class="dim">43 passed in 12.4s</span>');
+    }
+    if (c === "secret") {
+      L.push('  <span class="ok">✓</span> Build Image                   <span class="dim">make docker-build-env ENV=production</span>');
+      L.push('  <span class="ok">✓</span> Log in to Docker Hub');
+      L.push('  <span class="ok">✓</span> Push Image                    <span class="dim">my-agent:production</span>');
+      L.push('\n<span class="bad">deployed container: SyntaxError in src/main.py — crash loop</span>');
+      L.push('<span class="dim">the image built fine; Python never imported the module until runtime</span>');
+      document.getElementById("ci-note").innerHTML =
+        `<div class="note danger"><span class="note-title">Shipped broken</span><p>Docker build only installs dependencies and copies files — it never imports your code, so a syntax error passes the build and fails at container start. Even a bare <code>python -c "import src.main"</code> step would have caught it. And because the tag is mutable, the previous good image is already overwritten.</p></div>`;
+    } else if (c === "broken") {
+      L.push('  <span class="ok">✓</span> Build Image');
+      L.push('  <span class="ok">✓</span> Log in to Docker Hub');
+      L.push('  <span class="ok">✓</span> Push Image                    <span class="dim">my-agent:production</span>');
+      L.push('\n<span class="warnc">green build, broken behaviour — the failing test was never run</span>');
+      document.getElementById("ci-note").innerHTML =
+        `<div class="note warn"><span class="note-title">Green and wrong</span><p>The workflow reports success because it only builds and pushes. A test suite exists in the repository; nothing in CI executes it. Switch the test step on to see the difference.</p></div>`;
+    } else {
+      L.push('  <span class="ok">✓</span> Build Image                   <span class="dim">layers cached, 14s</span>');
+      L.push('  <span class="ok">✓</span> Log in to Docker Hub          <span class="dim">--password-stdin (never in argv)</span>');
+      L.push('  <span class="ok">✓</span> Push Image                    <span class="dim">my-agent:production</span>');
+      L.push('\n<span class="ok">workflow succeeded</span>');
+      document.getElementById("ci-note").innerHTML =
+        `<div class="note"><span class="note-title">Shipped</span><p>Note <code>--password-stdin</code>: passing the secret as an argument would leak it into the process list and into CI logs. Still missing: an immutable SHA tag, so there is nothing to roll back to.</p></div>`;
+    }
+    document.getElementById("ci-out").innerHTML = L.join("\n");
+  }
+  document.getElementById("ci-case").addEventListener("change", ciRender);
+  document.getElementById("ci-tests").addEventListener("change", ciRender);
+  ciRender();
+}
+</script>
+</body>
+</html>

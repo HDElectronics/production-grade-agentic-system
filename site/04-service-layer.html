@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 — Service layer · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 04 · Core</div>
+<h1>The service layer</h1>
+<p class="lede">
+  Routes should be boring. Everything that can fail under load — the database connection, the LLM provider —
+  is wrapped in a service that owns the failure: a bounded connection pool, exponential-backoff retries, and
+  circular fallback across models. This is the layer that decides whether an outage is a blip or an incident.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>
+  Two external dependencies dominate an agent's runtime, and neither is reliable at the moment you need it.
+  Postgres will refuse connections past <code>max_connections</code>; the LLM provider will rate-limit you,
+  time out, or return 500s in bursts. Handling either <em>inside</em> a route handler means duplicating the
+  logic in every route and getting it subtly wrong in most of them.
+</p>
+<p>So both live behind singletons: <code>database_service</code> and <code>llm_service</code>.</p>
+
+<h2 id="pooling">Connection pooling</h2>
+<p>
+  Opening a Postgres connection costs a TCP handshake, TLS, and authentication — tens of milliseconds before
+  your query runs. At one connection per request, that overhead dominates, and at a few hundred concurrent
+  requests the database refuses new connections entirely. A pool keeps a fixed set open and hands them out.
+</p>
+
+<div class="code" data-lang="python" data-file="src/data/db_manager.py">
+<pre>
+from sqlalchemy.pool import QueuePool
+from sqlmodel import Session, SQLModel, create_engine, select
+
+
+class DatabaseService:
+    """Singleton owning the connection pool and all CRUD."""
+
+    def __init__(self):
+        try:
+            connection_url = (
+                f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}"
+                f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
+            )
+
+            self.engine = create_engine(
+                connection_url,
+                poolclass=QueuePool,
+                pool_size=settings.POSTGRES_POOL_SIZE,        # kept open permanently
+                max_overflow=settings.POSTGRES_MAX_OVERFLOW,  # temporary burst headroom
+                pool_pre_ping=True,   # SELECT 1 before handing a connection out
+                pool_timeout=30,      # give up waiting after 30s -&gt; TimeoutError
+                pool_recycle=1800,    # drop connections older than 30 min
+            )
+
+            # Code-first schema creation. Fine at this scale; graduate to
+            # Alembic the moment you need a non-destructive column change.
+            SQLModel.metadata.create_all(self.engine)
+            logger.info("database_initialized", pool_size=settings.POSTGRES_POOL_SIZE)
+
+        except SQLAlchemyError as e:
+            logger.error("database_initialization_failed", error=str(e))
+            # Dev should crash loudly. Production may prefer to start
+            # degraded and let the healthcheck report it.
+            if settings.ENVIRONMENT != Environment.PRODUCTION:
+                raise
+
+
+database_service = DatabaseService()      # one pool per process
+</pre>
+</div>
+
+<h3>The four parameters that matter</h3>
+<dl class="kv">
+  <dt>pool_size</dt><dd>Steady-state connections held open. Total across your fleet must stay under Postgres <code>max_connections</code> — with 4 workers and <code>pool_size=20</code> you are already at 80 before overflow.</dd>
+  <dt>max_overflow</dt><dd>Extra connections allowed during a spike, closed again when returned. Burst capacity without paying for it permanently.</dd>
+  <dt>pool_pre_ping</dt><dd>Cheap liveness check before reuse. Without it, the first request after an idle period fails with a broken pipe — because a firewall or the database silently dropped the socket.</dd>
+  <dt>pool_recycle</dt><dd>Proactively closes connections older than 30 minutes. Managed Postgres (RDS, Cloud SQL) and load balancers cut idle connections on their own schedule; recycling first means you never notice.</dd>
+</dl>
+
+<div class="note warn">
+  <span class="note-title">The arithmetic that bites people</span>
+  <p>Max concurrent DB work per process is <code>pool_size + max_overflow</code>. Request 21 with
+  <code>pool_size=20, max_overflow=10</code> does not fail — it <em>waits</em>, up to <code>pool_timeout</code>
+  seconds. That latency shows up as a p99 spike with no slow query to blame, which is one of the harder
+  things to diagnose from a dashboard. The pool exhaustion is upstream of the symptom.</p>
+</div>
+
+<h3>CRUD stays thin</h3>
+<div class="code" data-lang="python" data-file="src/data/db_manager.py">
+<pre>
+async def get_user_by_email(self, email: str) -&gt; Optional[User]:
+    # The context manager returns the connection to the pool on exit,
+    # including when the body raises. Forgetting this is how pools leak.
+    with Session(self.engine) as session:
+        statement = select(User).where(User.email == email)
+        return session.exec(statement).first()
+
+
+async def create_session(self, session_id: str, user_id: int, name: str = "") -&gt; ChatSession:
+    with Session(self.engine) as session:
+        chat_session = ChatSession(id=session_id, user_id=user_id, name=name)
+        session.add(chat_session)
+        session.commit()
+        session.refresh(chat_session)     # pull DB-assigned defaults back
+        return chat_session
+
+
+async def health_check(self) -&gt; bool:
+    """Used by /health, which Docker and Kubernetes poll."""
+    try:
+        with Session(self.engine) as session:
+            session.exec(select(1))
+        return True
+    except Exception as e:
+        logger.error("database_health_check_failed", error=str(e))
+        return False
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">A deliberate wart worth knowing about</span>
+  <p>These methods are <code>async def</code> but call the <em>synchronous</em> SQLModel API, so each one
+  blocks the event loop for the duration of its query. At this scale the queries are indexed point-lookups
+  and it does not matter. It would matter under heavy load or with slow queries — the fix is
+  <code>AsyncSession</code> with an async driver (<code>asyncpg</code>), or offloading to a thread pool.
+  Worth knowing before you copy the pattern into something hotter.</p>
+</div>
+
+<h2 id="toy-pool">Toy example: watch a pool saturate</h2>
+<p>
+  Turn up concurrency and watch the pool fill, spill into overflow, and start queueing. The p95 climbing
+  while every individual query stays fast is the signature of pool exhaustion.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Connection pool simulator</span>
+    <span class="widget-tag">QueuePool</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="p-size">pool_size <span class="val" id="p-size-val"></span></label>
+        <input type="range" id="p-size" min="1" max="20" value="5">
+      </div>
+      <div class="ctrl">
+        <label for="p-over">max_overflow <span class="val" id="p-over-val"></span></label>
+        <input type="range" id="p-over" min="0" max="20" value="10">
+      </div>
+      <div class="ctrl">
+        <label for="p-conc">concurrent requests <span class="val" id="p-conc-val"></span></label>
+        <input type="range" id="p-conc" min="1" max="60" value="8">
+      </div>
+      <div class="ctrl">
+        <label for="p-dur">query time (ms) <span class="val" id="p-dur-val"></span></label>
+        <input type="range" id="p-dur" min="5" max="400" step="5" value="40">
+      </div>
+    </div>
+    <div class="slots" id="p-slots"></div>
+    <div class="stats">
+      <div class="stat"><div class="k">in pool</div><div class="v" id="p-inpool">0</div></div>
+      <div class="stat"><div class="k">overflow</div><div class="v warn" id="p-inover">0</div></div>
+      <div class="stat"><div class="k">waiting</div><div class="v bad" id="p-wait">0</div></div>
+      <div class="stat"><div class="k">est. p95 latency</div><div class="v" id="p-p95">0 ms</div></div>
+      <div class="stat"><div class="k">verdict</div><div class="v" id="p-verdict" style="font-size:14px">healthy</div></div>
+    </div>
+    <div class="out" id="p-out"></div>
+    <div class="widget-note">
+      Legend: <span style="color:var(--accent)">■</span> pooled ·
+      <span style="color:var(--warn)">■</span> overflow ·
+      <span style="color:var(--danger)">■</span> queued waiting for a free connection.
+    </div>
+  </div>
+</div>
+
+<h2 id="registry">The LLM registry</h2>
+<p>
+  Models are pre-instantiated once and looked up by name, so switching "brains" mid-request costs nothing.
+  Note the production-only sampling parameters — the same registry behaves differently per environment.
+</p>
+
+<div class="code" data-lang="python" data-file="src/services/llm_provider.py">
+<pre>
+class LLMRegistry:
+    """Ordered registry — the order IS the fallback chain."""
+
+    LLMS: List[Dict[str, Any]] = [
+        {"name": "gpt-5-mini", "llm": ChatOpenAI(
+            model="gpt-5-mini", api_key=settings.OPENAI_API_KEY,
+            max_tokens=settings.MAX_TOKENS,
+            reasoning={"effort": "low"})},
+
+        {"name": "gpt-5", "llm": ChatOpenAI(
+            model="gpt-5", api_key=settings.OPENAI_API_KEY,
+            max_tokens=settings.MAX_TOKENS,
+            reasoning={"effort": "medium"})},
+
+        {"name": "gpt-5-nano", "llm": ChatOpenAI(
+            model="gpt-5-nano", api_key=settings.OPENAI_API_KEY,
+            max_tokens=settings.MAX_TOKENS,
+            reasoning={"effort": "minimal"})},
+
+        {"name": "gpt-4o", "llm": ChatOpenAI(
+            model="gpt-4o", temperature=settings.DEFAULT_LLM_TEMPERATURE,
+            api_key=settings.OPENAI_API_KEY, max_tokens=settings.MAX_TOKENS,
+            # Tighter sampling in production, looser locally for exploration
+            top_p=0.95 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.8,
+            presence_penalty=0.1 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.0,
+            frequency_penalty=0.1 if settings.ENVIRONMENT == Environment.PRODUCTION else 0.0)},
+
+        {"name": "gpt-4o-mini", "llm": ChatOpenAI(
+            model="gpt-4o-mini", temperature=settings.DEFAULT_LLM_TEMPERATURE,
+            api_key=settings.OPENAI_API_KEY, max_tokens=settings.MAX_TOKENS)},
+    ]
+
+    @classmethod
+    def get(cls, model_name: str) -&gt; BaseChatModel:
+        for entry in cls.LLMS:
+            if entry["name"] == model_name:
+                return entry["llm"]
+        return cls.LLMS[0]["llm"]          # unknown name -&gt; first entry
+
+    @classmethod
+    def get_all_names(cls) -&gt; List[str]:
+        return [entry["name"] for entry in cls.LLMS]
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Order the registry by capability, not by cost</span>
+  <p>Fallback rotates <em>forward</em> through this list. Put a model you'd be happy to serve next in line —
+  if your fallback is dramatically weaker, a provider blip silently degrades answer quality instead of
+  producing an error you'd notice. Quality regressions are much harder to detect than 500s, which is
+  precisely why <a href="09-evaluation.html">layer 09</a> exists.</p>
+</div>
+
+<h2 id="retries">Retries and circular fallback</h2>
+<p>Two nested strategies. <strong>Retry</strong> handles a bad second; <strong>fallback</strong> handles a bad hour.</p>
+
+<div class="code" data-lang="python" data-file="src/services/llm_provider.py">
+<pre>
+class LLMService:
+    def __init__(self):
+        self._llm: Optional[BaseChatModel] = None
+        self._current_model_index: int = 0
+        try:
+            self._llm = LLMRegistry.get(settings.DEFAULT_LLM_MODEL)
+            self._current_model_index = LLMRegistry.get_all_names().index(
+                settings.DEFAULT_LLM_MODEL)
+        except ValueError:
+            self._llm = LLMRegistry.LLMS[0]["llm"]
+
+    def _switch_to_next_model(self) -&gt; bool:
+        """Circular: the last entry wraps around to the first."""
+        try:
+            next_index = (self._current_model_index + 1) % len(LLMRegistry.LLMS)
+            next_model_entry = LLMRegistry.LLMS[next_index]
+            logger.warning("switching_model_fallback",
+                           old_index=self._current_model_index,
+                           new_model=next_model_entry["name"])
+            self._current_model_index = next_index
+            self._llm = next_model_entry["llm"]
+            return True
+        except Exception as e:
+            logger.error("model_switch_failed", error=str(e))
+            return False
+
+    @retry(
+        stop=stop_after_attempt(settings.MAX_LLM_CALL_RETRIES),   # 3 attempts
+        wait=wait_exponential(multiplier=1, min=2, max=10),       # 2s, 4s, 8s (capped)
+        # Only retry what a retry can actually fix. A 400 for a malformed
+        # request will fail identically every time — retrying it just
+        # multiplies the latency before the user sees the error.
+        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+        before_sleep=before_sleep_log(logger, "WARNING"),
+        reraise=True,
+    )
+    async def _call_with_retry(self, messages: List[BaseMessage]) -&gt; BaseMessage:
+        if not self._llm:
+            raise RuntimeError("LLM not initialized")
+        return await self._llm.ainvoke(messages)
+
+    async def call(self, messages: List[BaseMessage]) -&gt; BaseMessage:
+        """Retry loop wrapped in a fallback loop."""
+        total_models = len(LLMRegistry.LLMS)
+        models_tried = 0
+
+        while models_tried &lt; total_models:
+            try:
+                return await self._call_with_retry(messages)
+            except OpenAIError as e:
+                models_tried += 1
+                logger.error("model_failed_exhausted_retries",
+                             model=LLMRegistry.LLMS[self._current_model_index]["name"],
+                             error=str(e))
+                if models_tried &gt;= total_models:
+                    break
+                self._switch_to_next_model()
+
+        raise RuntimeError("Failed to get response from any LLM after exhausting all options.")
+
+    def bind_tools(self, tools: List) -&gt; "LLMService":
+        if self._llm:
+            self._llm = self._llm.bind_tools(tools)
+        return self
+
+
+llm_service = LLMService()
+</pre>
+</div>
+
+<div class="note danger">
+  <span class="note-title">Worst-case latency is a multiplication, not an addition</span>
+  <p>3 attempts × (2s + 4s + 8s of backoff) × 5 models is well over a minute of waiting before
+  <code>call()</code> finally raises. Your HTTP timeout, your reverse proxy's timeout and your client's
+  timeout will all fire long before that. Retries buy availability by <em>spending latency</em> — budget it
+  explicitly, and cap total attempts against your actual request deadline.</p>
+</div>
+
+<h2 id="toy-resilience">Toy example: the resilience layer under fire</h2>
+<p>
+  Set a per-call failure rate and how many models are having a bad day, then send requests. The log is the
+  same sequence you would see in production — including the <code>switching_model_fallback</code> line that
+  shows up in the <a href="10-stress-testing.html">stress test on page 10</a>.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Retry + circular fallback</span>
+    <span class="widget-tag">tenacity</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="r-fail">provider failure rate <span class="val" id="r-fail-val"></span></label>
+        <input type="range" id="r-fail" min="0" max="100" step="5" value="60" data-suffix="%">
+      </div>
+      <div class="ctrl">
+        <label for="r-down">models fully down <span class="val" id="r-down-val"></span></label>
+        <input type="range" id="r-down" min="0" max="5" value="1">
+      </div>
+      <div class="ctrl">
+        <label for="r-attempts">stop_after_attempt <span class="val" id="r-attempts-val"></span></label>
+        <input type="range" id="r-attempts" min="1" max="5" value="3">
+      </div>
+      <div class="ctrl">
+        <label>&nbsp;</label>
+        <div class="btn-row">
+          <button class="btn" id="r-go">Send request</button>
+          <button class="btn ghost" id="r-x20">Send ×20</button>
+          <button class="btn ghost" id="r-reset">Reset</button>
+        </div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">succeeded</div><div class="v good" id="r-ok">0</div></div>
+      <div class="stat"><div class="k">total failure</div><div class="v bad" id="r-fail-n">0</div></div>
+      <div class="stat"><div class="k">fallbacks used</div><div class="v warn" id="r-fb">0</div></div>
+      <div class="stat"><div class="k">avg added latency</div><div class="v" id="r-lat">0.0s</div></div>
+      <div class="stat"><div class="k">active model</div><div class="v" id="r-model" style="font-size:13px">gpt-5-mini</div></div>
+    </div>
+    <div class="out" id="r-out"></div>
+    <div class="widget-note">
+      Set failure rate to 100% and models-down to 5 to see the terminal case:
+      <code>RuntimeError: Failed to get response from any LLM</code> — the only condition under which the
+      user actually gets a 500.
+    </div>
+  </div>
+</div>
+
+<h2 id="circuit">Circuit breaking — what is here and what is not</h2>
+<p>
+  The rotation above is the load-shedding piece: a model that has failed is abandoned for the current request
+  and the service moves on. But the switch is <strong>sticky, not self-healing</strong>. <code>_current_model_index</code>
+  stays where it landed, so after an incident every subsequent request is served by whatever model happened to
+  be next in line — until a future failure rotates again, eventually wrapping back around.
+</p>
+
+<div class="note warn">
+  <span class="note-title">A real circuit breaker adds two things this does not have</span>
+  <p><strong>Per-model failure state:</strong> mark a model <em>open</em> after N consecutive failures and skip it
+  entirely for a cooldown, instead of re-paying its retry budget on the next request.
+  <strong>Half-open probing:</strong> after the cooldown, let a single request through; promote back to healthy
+  on success, re-open on failure. Without those, a hard provider outage costs every request the full retry
+  ladder before it can fall back. Worth adding if your primary model matters for quality — see the
+  latency arithmetic above.</p>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>Connection per request</td><td><code>FATAL: sorry, too many clients already</code></td><td><code>QueuePool</code> with a bounded size</td></tr>
+    <tr><td>No <code>pool_pre_ping</code></td><td>First request after a quiet night: broken pipe</td><td>Liveness check before checkout</td></tr>
+    <tr><td>No <code>pool_recycle</code></td><td>Random connection resets on managed Postgres</td><td>Recycle at 30 minutes</td></tr>
+    <tr><td>Session not context-managed</td><td>Pool leaks one connection per raised exception, then hangs</td><td><code>with Session(engine)</code></td></tr>
+    <tr><td>No retries</td><td>A single 429 becomes a user-visible 500</td><td>tenacity + exponential backoff</td></tr>
+    <tr><td>Retrying every exception</td><td>A malformed request is retried 3× before failing anyway</td><td><code>retry_if_exception_type(...)</code></td></tr>
+    <tr><td>Single model</td><td>Provider incident = full outage for you</td><td>Circular fallback across the registry</td></tr>
+    <tr><td>Unbounded retry ladder</td><td>Requests hang past every upstream timeout</td><td>Cap attempts against the request deadline</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const MODELS = ["gpt-5-mini", "gpt-5", "gpt-5-nano", "gpt-4o", "gpt-4o-mini"];
+
+function pageInit() {
+  /* ================= pool simulator ================= */
+  let size = 5, over = 10, conc = 8, dur = 40;
+  function poolRender() {
+    const pooled = Math.min(conc, size);
+    const overflow = Math.min(Math.max(conc - size, 0), over);
+    const waiting = Math.max(conc - size - over, 0);
+
+    let slots = "";
+    for (let i = 0; i < size; i++) slots += `<span class="slot${i < pooled ? " busy" : ""}">${i < pooled ? "▪" : ""}</span>`;
+    slots += '<span style="width:10px"></span>';
+    for (let i = 0; i < over; i++) slots += `<span class="slot${i < overflow ? " overflow" : ""}">${i < overflow ? "▪" : ""}</span>`;
+    if (waiting) {
+      slots += '<span style="width:10px"></span>';
+      for (let i = 0; i < Math.min(waiting, 24); i++) slots += '<span class="slot queued">⏳</span>';
+      if (waiting > 24) slots += `<span class="slot queued" style="width:auto;padding:0 6px">+${waiting - 24}</span>`;
+    }
+    document.getElementById("p-slots").innerHTML = slots;
+
+    document.getElementById("p-inpool").textContent = `${pooled}/${size}`;
+    document.getElementById("p-inover").textContent = `${overflow}/${over}`;
+    document.getElementById("p-wait").textContent = waiting;
+
+    // waiting requests serialise behind freed connections
+    const capacity = size + over;
+    const waves = Math.ceil(conc / capacity);
+    const p95 = dur * waves + (waiting ? dur : 0);
+    document.getElementById("p-p95").textContent = p95 + " ms";
+
+    const v = document.getElementById("p-verdict");
+    let msg, cls, note;
+    if (waiting > 0) {
+      const wouldTimeout = (waves * dur) > 30000;
+      cls = "v bad"; msg = wouldTimeout ? "timeouts" : "queueing";
+      note = `<span class="bad">${waiting} request(s) are blocked in QueuePool.connect(), waiting up to pool_timeout=30s.</span>
+They are not slow because the query is slow — the query still takes ${dur}ms. They are slow because there is
+no connection to run it on. This is the shape of the incident: p95 climbs, every individual query looks fine,
+and the database itself is nearly idle.
+
+<span class="dim">Fix by raising pool_size/max_overflow (bounded by Postgres max_connections),
+adding workers, or making the queries faster so connections return sooner.</span>`;
+    } else if (overflow > 0) {
+      cls = "v warn"; msg = "bursting";
+      note = `<span class="warnc">${overflow} connection(s) opened above pool_size.</span>
+Overflow connections are created on demand and closed when returned, so each one pays the full
+handshake cost. Fine for a spike; if this is your steady state, raise pool_size and stop paying it.`;
+    } else {
+      cls = "v good"; msg = "healthy";
+      note = `<span class="ok">All ${conc} concurrent request(s) served from the persistent pool.</span>
+No handshake cost, no waiting. Headroom: ${size - pooled} pooled + ${over} overflow before anything queues.`;
+    }
+    v.className = cls; v.textContent = msg;
+    document.getElementById("p-out").innerHTML =
+      `<span class="dim">concurrency ${conc} · pool_size ${size} · max_overflow ${over} · capacity ${capacity}</span>\n\n${note}`;
+  }
+  bindRange("p-size", v => { size = v; poolRender(); });
+  bindRange("p-over", v => { over = v; poolRender(); });
+  bindRange("p-conc", v => { conc = v; poolRender(); });
+  bindRange("p-dur", v => { dur = v; poolRender(); });
+
+  /* ================= retry / fallback ================= */
+  let failRate = 0.6, downCount = 1, attempts = 3;
+  let idx = 0, nOk = 0, nFail = 0, nFb = 0, latSum = 0, nReq = 0, rlog = [];
+
+  function attempt(model, downSet) {
+    if (downSet.has(model)) return false;
+    return Math.random() >= failRate;
+  }
+  function sendOne() {
+    const downSet = new Set(MODELS.slice(0, downCount));
+    nReq++;
+    let latency = 0, tried = 0, success = false, usedFallback = false;
+    rlog.push(`<span class="dim">─── request #${nReq} ───</span>`);
+    while (tried < MODELS.length) {
+      const model = MODELS[idx];
+      let got = false;
+      for (let a = 1; a <= attempts; a++) {
+        if (attempt(model, downSet)) {
+          rlog.push(`  <span class="ok">200</span> ${model} <span class="dim">attempt ${a}/${attempts}</span>`);
+          got = true; break;
+        }
+        const backoff = Math.min(Math.pow(2, a), 10);
+        if (a < attempts) {
+          latency += backoff;
+          rlog.push(`  <span class="warnc">RateLimitError</span> ${model} <span class="dim">attempt ${a}/${attempts} → sleeping ${backoff}s</span>`);
+        } else {
+          rlog.push(`  <span class="bad">model_failed_exhausted_retries</span> model=${model}`);
+        }
+      }
+      if (got) { success = true; break; }
+      tried++;
+      if (tried >= MODELS.length) break;
+      idx = (idx + 1) % MODELS.length;
+      usedFallback = true;
+      rlog.push(`  <span class="warnc">switching_model_fallback</span> new_model=${MODELS[idx]}`);
+    }
+    if (success) { nOk++; if (usedFallback) nFb++; }
+    else { nFail++; rlog.push('  <span class="bad">RuntimeError: Failed to get response from any LLM after exhausting all options.</span>'); }
+    latSum += latency;
+    rRender();
+  }
+  function rRender() {
+    document.getElementById("r-ok").textContent = nOk;
+    document.getElementById("r-fail-n").textContent = nFail;
+    document.getElementById("r-fb").textContent = nFb;
+    document.getElementById("r-lat").textContent = (nReq ? latSum / nReq : 0).toFixed(1) + "s";
+    document.getElementById("r-model").textContent = MODELS[idx];
+    document.getElementById("r-out").innerHTML =
+      rlog.slice(-26).join("\n") || '<span class="dim">Press “Send request” to call llm_service.call(messages).</span>';
+    document.getElementById("r-out").scrollTop = 1e6;
+  }
+  bindRange("r-fail", v => { failRate = v / 100; });
+  bindRange("r-down", v => { downCount = v; });
+  bindRange("r-attempts", v => { attempts = v; });
+  document.getElementById("r-go").addEventListener("click", sendOne);
+  document.getElementById("r-x20").addEventListener("click", () => { for (let i = 0; i < 20; i++) sendOne(); });
+  document.getElementById("r-reset").addEventListener("click", () => {
+    idx = 0; nOk = nFail = nFb = latSum = nReq = 0; rlog = []; rRender();
+  });
+  rRender();
+}
+</script>
+</body>
+</html>

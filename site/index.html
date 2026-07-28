@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Production-Grade Agentic AI System — Interactive Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<main class="content">
+
+  <div class="eyebrow">Interactive handbook</div>
+  <h1>Production-Grade Agentic AI System</h1>
+  <p class="lede">
+    An agentic system that survives real traffic is not one service — it is a stack of
+    layers, each owning one failure mode. This handbook takes the reference implementation in this
+    repository apart, one concept per page, with the real source code, the reasoning behind each
+    decision, and a runnable toy example you can poke at in the browser.
+  </p>
+
+  <div class="note">
+    <span class="note-title">How to read this</span>
+    <p>Every page follows the same shape: <strong>the problem</strong> → <strong>the production code</strong>
+    → <strong>a toy example you can run right here</strong> → <strong>the failure modes it protects you from</strong>.
+    Nothing on this site calls a network. All simulations run locally in JavaScript so you can
+    change the inputs and watch the behaviour change.</p>
+  </div>
+
+  <h2 id="what">What the system actually is</h2>
+  <p>
+    A stateful chat agent exposed as an HTTP API, sized for roughly <strong>10,000 active users</strong>. A user
+    registers, opens a chat session, and streams tokens back from a LangGraph agent that can call tools,
+    remembers facts about them across sessions, persists its state in Postgres, and keeps working when the
+    LLM provider misbehaves. Around that sit rate limits, structured logs, Prometheus metrics, LLM-as-a-judge
+    evaluation, and a Docker/CI story.
+  </p>
+
+  <dl class="kv">
+    <dt>API</dt><dd>FastAPI + Uvicorn (uvloop), versioned under <code>/api/v1</code></dd>
+    <dt>Agent</dt><dd>LangGraph <code>StateGraph</code> with a chat node and a tool node, Postgres checkpointer</dd>
+    <dt>Memory</dt><dd>Short-term = checkpointed message list · Long-term = <code>mem0ai</code> over pgvector</dd>
+    <dt>Data</dt><dd>PostgreSQL 16 + pgvector, SQLModel ORM, pooled with SQLAlchemy <code>QueuePool</code></dd>
+    <dt>Security</dt><dd>JWT (HS256), bcrypt, SlowAPI rate limits, input sanitisation</dd>
+    <dt>Observability</dt><dd>structlog, Prometheus + Grafana + cAdvisor, Langfuse traces</dd>
+    <dt>Quality</dt><dd>LLM-as-a-judge evals scoring hallucination, toxicity, relevancy, helpfulness, conciseness</dd>
+  </dl>
+
+  <h2 id="layers">The nine layers</h2>
+  <p>Click any card to open its page.</p>
+
+  <div class="cards">
+    <a class="card" href="01-modular-codebase.html">
+      <div class="card-num">01</div>
+      <div class="card-title">Modular codebase</div>
+      <div class="card-desc">Dependency management, environment-aware settings, and the Docker Compose topology that makes the rest possible.</div>
+      <div class="card-tags"><span class="tag">pyproject.toml</span><span class="tag">Settings</span><span class="tag">compose</span></div>
+    </a>
+    <a class="card" href="02-data-persistence.html">
+      <div class="card-num">02</div>
+      <div class="card-title">Data persistence</div>
+      <div class="card-desc">SQLModel entities, the DRY base model, and DTOs that stop your password hash leaking into a JSON response.</div>
+      <div class="card-tags"><span class="tag">SQLModel</span><span class="tag">Pydantic</span><span class="tag">DTO</span></div>
+    </a>
+    <a class="card" href="03-security.html">
+      <div class="card-num">03</div>
+      <div class="card-title">Security &amp; safeguards</div>
+      <div class="card-desc">Rate limiting, sanitisation, JWT minting and verification, and context-window trimming so a long chat can't bankrupt you.</div>
+      <div class="card-tags"><span class="tag">SlowAPI</span><span class="tag">JWT</span><span class="tag">trim_messages</span></div>
+    </a>
+    <a class="card" href="04-service-layer.html">
+      <div class="card-num">04</div>
+      <div class="card-title">Service layer</div>
+      <div class="card-desc">Connection pooling under concurrency, exponential-backoff retries, and circular model fallback when a provider goes down.</div>
+      <div class="card-tags"><span class="tag">QueuePool</span><span class="tag">tenacity</span><span class="tag">fallback</span></div>
+    </a>
+    <a class="card" href="05-agent-architecture.html">
+      <div class="card-num">05</div>
+      <div class="card-title">Agentic architecture</div>
+      <div class="card-desc">The LangGraph state machine, tool-calling loop, Postgres checkpoints, and long-term memory over pgvector.</div>
+      <div class="card-tags"><span class="tag">LangGraph</span><span class="tag">mem0ai</span><span class="tag">checkpointer</span></div>
+    </a>
+    <a class="card" href="06-api-gateway.html">
+      <div class="card-num">06</div>
+      <div class="card-title">API gateway</div>
+      <div class="card-desc">Dependency-injected auth, session tokens, and Server-Sent Events streaming that makes a slow LLM feel fast.</div>
+      <div class="card-tags"><span class="tag">Depends()</span><span class="tag">SSE</span><span class="tag">OAuth2 form</span></div>
+    </a>
+    <a class="card" href="07-observability.html">
+      <div class="card-num">07</div>
+      <div class="card-title">Observability</div>
+      <div class="card-desc">Prometheus counters and histograms, middleware ordering, contextual structured logs, and app lifespan wiring.</div>
+      <div class="card-tags"><span class="tag">Prometheus</span><span class="tag">structlog</span><span class="tag">lifespan</span></div>
+    </a>
+    <a class="card" href="08-devops.html">
+      <div class="card-num">08</div>
+      <div class="card-title">DevOps automation</div>
+      <div class="card-desc">Layer-cached Dockerfile, fail-fast entrypoint, dashboards as code, Makefile ergonomics, and CI to Docker Hub.</div>
+      <div class="card-tags"><span class="tag">Dockerfile</span><span class="tag">Makefile</span><span class="tag">GH Actions</span></div>
+    </a>
+    <a class="card" href="09-evaluation.html">
+      <div class="card-num">09</div>
+      <div class="card-title">Evaluation framework</div>
+      <div class="card-desc">LLM-as-a-judge with structured output, a rubric per metric, and scores pushed back onto production traces.</div>
+      <div class="card-tags"><span class="tag">judge</span><span class="tag">Langfuse</span><span class="tag">rubrics</span></div>
+    </a>
+    <a class="card" href="10-stress-testing.html">
+      <div class="card-num">10</div>
+      <div class="card-title">Stress testing</div>
+      <div class="card-desc">1,500 concurrent users against the real chat path, then reading the damage in Prometheus and Langfuse.</div>
+      <div class="card-tags"><span class="tag">asyncio</span><span class="tag">p95</span><span class="tag">RPS</span></div>
+    </a>
+  </div>
+
+  <h2 id="lifecycle">Interactive: follow one request through the stack</h2>
+  <p>
+    Every layer in this handbook shows up in the life of a single <code>POST /api/v1/chatbot/chat/stream</code>.
+    Step through it. Each stop links to the page that builds that piece.
+  </p>
+
+  <div class="widget">
+    <div class="widget-head">
+      <span class="widget-title">Request lifecycle walkthrough</span>
+      <span class="widget-tag">stepper</span>
+    </div>
+    <div class="widget-body">
+      <div class="btn-row" style="margin-bottom:14px">
+        <button class="btn" id="lc-next">Step forward →</button>
+        <button class="btn ghost" id="lc-reset">Reset</button>
+        <span class="dim mono" id="lc-count" style="font-size:12px"></span>
+      </div>
+      <div class="out" id="lc-out"></div>
+      <div id="lc-detail" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <h2 id="map">Repository map</h2>
+  <p>
+    The write-up in <code>README.md</code> names the package <code>app/</code>; the code that actually ships in this
+    repo lives under <code>src/</code> with clearer module names. Same architecture, different labels — this table is
+    the decoder ring, and every page tells you which real file it is quoting.
+  </p>
+
+  <table>
+    <thead><tr><th>Concern</th><th>Real file (this repo)</th><th>Named in the write-up</th><th>Page</th></tr></thead>
+    <tbody>
+      <tr><td>Settings</td><td><code>src/config/settings.py</code></td><td><code>app/core/config.py</code></td><td><a href="01-modular-codebase.html">01</a></td></tr>
+      <tr><td>ORM models</td><td><code>src/data/models/</code></td><td><code>app/models/</code></td><td><a href="02-data-persistence.html">02</a></td></tr>
+      <tr><td>API schemas (DTOs)</td><td><code>src/data/schemas/</code></td><td><code>app/schemas/</code></td><td><a href="02-data-persistence.html">02</a></td></tr>
+      <tr><td>Rate limiter</td><td><code>src/system/rate_limit.py</code></td><td><code>app/core/limiter.py</code></td><td><a href="03-security.html">03</a></td></tr>
+      <tr><td>Sanitisation</td><td><code>src/utils/sanitization.py</code></td><td><code>app/utils/sanitization.py</code></td><td><a href="03-security.html">03</a></td></tr>
+      <tr><td>JWT helpers</td><td><code>src/utils/auth.py</code></td><td><code>app/utils/auth.py</code></td><td><a href="03-security.html">03</a></td></tr>
+      <tr><td>Context trimming</td><td><code>src/utils/graph.py</code></td><td><code>app/utils/graph.py</code></td><td><a href="03-security.html">03</a></td></tr>
+      <tr><td>DB service / pool</td><td><code>src/data/db_manager.py</code></td><td><code>app/services/database.py</code></td><td><a href="04-service-layer.html">04</a></td></tr>
+      <tr><td>LLM resilience</td><td><code>src/services/llm_provider.py</code></td><td><code>app/services/llm.py</code></td><td><a href="04-service-layer.html">04</a></td></tr>
+      <tr><td>Agent graph</td><td><code>src/agent/workflow.py</code></td><td><code>app/core/langgraph/graph.py</code></td><td><a href="05-agent-architecture.html">05</a></td></tr>
+      <tr><td>Tools &amp; prompts</td><td><code>src/agent/tools/</code>, <code>src/agent/prompts/</code></td><td><code>app/core/langgraph/tools/</code></td><td><a href="05-agent-architecture.html">05</a></td></tr>
+      <tr><td>Auth routes</td><td><code>src/interface/auth.py</code></td><td><code>app/api/v1/auth.py</code></td><td><a href="06-api-gateway.html">06</a></td></tr>
+      <tr><td>Chat routes</td><td><code>src/interface/interaction.py</code></td><td><code>app/api/v1/chatbot.py</code></td><td><a href="06-api-gateway.html">06</a></td></tr>
+      <tr><td>Metrics</td><td><code>src/system/telemetry.py</code></td><td><code>app/core/metrics.py</code></td><td><a href="07-observability.html">07</a></td></tr>
+      <tr><td>Middleware</td><td><code>src/system/middleware.py</code></td><td><code>app/core/middleware.py</code></td><td><a href="07-observability.html">07</a></td></tr>
+      <tr><td>Structured logging</td><td><code>src/system/logs.py</code></td><td><code>app/core/logging.py</code></td><td><a href="07-observability.html">07</a></td></tr>
+      <tr><td>App entrypoint</td><td><code>src/main.py</code></td><td><code>app/main.py</code></td><td><a href="07-observability.html">07</a></td></tr>
+      <tr><td>Evaluations</td><td><code>evals/</code></td><td><code>evals/</code></td><td><a href="09-evaluation.html">09</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="run">Running the real thing</h2>
+  <p>The handbook is standalone, but the code it documents starts with three commands:</p>
+
+  <div class="code" data-lang="bash" data-file="terminal">
+<pre>
+# 1. Configure an environment (development | staging | production)
+cp .env.example .env.development
+$EDITOR .env.development        # OPENAI_API_KEY, JWT_SECRET_KEY, POSTGRES_*
+
+# 2. Bring up Postgres+pgvector, the API, Prometheus, Grafana and cAdvisor
+make docker-run-env ENV=development
+
+# 3. Open the interactive API docs
+open http://localhost:8000/docs
+</pre>
+  </div>
+
+  <p>
+    Ports once the stack is up: API <code>:8000</code>, Grafana <code>:3000</code>,
+    Prometheus <code>:9090</code>, cAdvisor <code>:8080</code>, Postgres <code>:5432</code>.
+  </p>
+
+  <h2 id="path">Suggested reading order</h2>
+  <p>
+    The pages are ordered as a build: each one depends on the ones before it. If you only have time
+    for three, read <a href="04-service-layer.html">04 — Service layer</a> (why the system stays up),
+    <a href="05-agent-architecture.html">05 — Agentic architecture</a> (what actually makes it an agent),
+    and <a href="07-observability.html">07 — Observability</a> (how you find out it broke before your users tell you).
+  </p>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const LIFECYCLE = [
+  { t: "Client sends POST /api/v1/chatbot/chat/stream", d:
+    "Body: <code>{messages: [{role: 'user', content: '…'}]}</code>. Header: <code>Authorization: Bearer &lt;session token&gt;</code> — note that this is a <em>session</em>-scoped JWT, not the user's login token.",
+    link: ["06-api-gateway.html", "06 — API gateway"] },
+  { t: "LoggingContextMiddleware binds request context", d:
+    "Outermost middleware. It clears any leaked context, decodes the JWT <em>without verifying it</em> just to read <code>sub</code>, and binds it so that every log line emitted downstream — including auth failures — carries the subject id.",
+    link: ["07-observability.html", "07 — Observability"] },
+  { t: "MetricsMiddleware starts the stopwatch", d:
+    "A <code>time.time()</code> in a <code>try/finally</code>. Whatever happens next — 200, 422, unhandled exception — the duration and status land in <code>http_request_duration_seconds</code> and <code>http_requests_total</code>.",
+    link: ["07-observability.html", "07 — Observability"] },
+  { t: "SlowAPI checks the rate limit", d:
+    "<code>@limiter.limit(settings.RATE_LIMIT_ENDPOINTS['chat_stream'][0])</code> — 100/minute keyed by client IP. Over the limit and the request dies here with a 429, before it can cost you a single LLM token.",
+    link: ["03-security.html", "03 — Security & safeguards"] },
+  { t: "Depends(get_current_session) authenticates", d:
+    "Sanitises the raw token string, verifies the HS256 signature and expiry, then loads the Session row from Postgres. Failure raises 401/404 and the handler body never runs.",
+    link: ["06-api-gateway.html", "06 — API gateway"] },
+  { t: "Pydantic validates the payload", d:
+    "<code>ChatRequest</code> enforces at least one message, roles restricted to <code>user|assistant|system</code>, content between 1 and 3000 characters, and a validator that rejects embedded <code>&lt;script&gt;</code> tags.",
+    link: ["02-data-persistence.html", "02 — Data persistence"] },
+  { t: "Long-term memory is searched", d:
+    "Before the graph runs, <code>mem0ai</code> does a vector search over pgvector scoped to this <code>user_id</code>, using the newest message as the query. Hits are formatted into a bullet list and injected into the system prompt.",
+    link: ["05-agent-architecture.html", "05 — Agentic architecture"] },
+  { t: "LangGraph resumes the thread from a checkpoint", d:
+    "<code>thread_id = session.id</code>. AsyncPostgresSaver loads whatever state existed at the end of the last turn, so a server restart mid-conversation is invisible to the user.",
+    link: ["05-agent-architecture.html", "05 — Agentic architecture"] },
+  { t: "chat node: trim → call → route", d:
+    "History is trimmed to fit <code>MAX_TOKENS</code> with the system prompt always kept, the LLM service is invoked, and the response routes to <code>tool_call</code> if the model asked for a tool, otherwise to <code>END</code>.",
+    link: ["05-agent-architecture.html", "05 — Agentic architecture"] },
+  { t: "LLM service absorbs provider failure", d:
+    "tenacity retries rate-limit/timeout/API errors with exponential backoff (2s, 4s, 8s…). If a model exhausts its retries, the service rotates to the next entry in the registry and starts over. Users see a slower answer, not a 500.",
+    link: ["04-service-layer.html", "04 — Service layer"] },
+  { t: "Tokens stream back as Server-Sent Events", d:
+    "Each token is wrapped as <code>data: {\"content\": \"…\", \"done\": false}\\n\\n</code> and flushed immediately, closed by a final <code>done: true</code> frame. Even a crash mid-stream is delivered as a frame, never a dangling socket.",
+    link: ["06-api-gateway.html", "06 — API gateway"] },
+  { t: "Memory update is fired and forgotten", d:
+    "<code>asyncio.create_task(...)</code> hands the finished transcript to mem0ai, which uses an LLM to extract durable facts. The user is not made to wait for a write they don't care about.",
+    link: ["05-agent-architecture.html", "05 — Agentic architecture"] },
+  { t: "Langfuse records the trace; the judge grades it later", d:
+    "The CallbackHandler attached to the run ships spans, latency and cost to Langfuse. A scheduled eval job replays those traces against five rubrics and writes scores back, so prompt regressions show up as a trend line.",
+    link: ["09-evaluation.html", "09 — Evaluation framework"] },
+];
+
+function pageInit() {
+  let step = 0;
+  const out = document.getElementById("lc-out");
+  const detail = document.getElementById("lc-detail");
+  const count = document.getElementById("lc-count");
+  const next = document.getElementById("lc-next");
+
+  function render() {
+    out.innerHTML = LIFECYCLE.slice(0, step).map((s, i) =>
+      `<div style="${i === step - 1 ? "color:var(--accent)" : ""}"><span class="dim">${String(i + 1).padStart(2, "0")}</span>  ${s.t}</div>`
+    ).join("") || '<span class="dim">Press “Step forward” to trace the request…</span>';
+    out.scrollTop = out.scrollHeight;
+    count.textContent = `${step} / ${LIFECYCLE.length}`;
+    if (step > 0) {
+      const s = LIFECYCLE[step - 1];
+      detail.innerHTML = `<div class="note"><span class="note-title">Stop ${step}</span><p>${s.d}</p>
+        <p style="margin-bottom:0"><a href="${s.link[0]}">Read the implementation → ${s.link[1]}</a></p></div>`;
+    } else detail.innerHTML = "";
+    next.disabled = step >= LIFECYCLE.length;
+    next.textContent = step >= LIFECYCLE.length ? "Request complete ✓" : "Step forward →";
+  }
+  next.addEventListener("click", () => { step = Math.min(step + 1, LIFECYCLE.length); render(); });
+  document.getElementById("lc-reset").addEventListener("click", () => { step = 0; render(); });
+  render();
+}
+</script>
+</body>
+</html>

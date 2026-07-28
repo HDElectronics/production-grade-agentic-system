@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 — Agentic architecture · Agentic System Handbook</title>
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<main class="content">
+
+<div class="eyebrow">Layer 05 · Core</div>
+<h1>Multi-agentic architecture</h1>
+<p class="lede">
+  A chain runs input → LLM → output and forgets. A graph loops, calls tools, checkpoints its state to Postgres
+  after every step, and carries facts about the user between conversations. This page is
+  <code>src/agent/workflow.py</code> taken apart — the single most important file in the repository.
+</p>
+
+<div class="toc" data-toc></div>
+
+<h2 id="problem">The problem it solves</h2>
+<p>Four requirements that a linear chain cannot satisfy:</p>
+<ul>
+  <li><strong>Looping.</strong> "Search the web, read the results, then answer" is a cycle, not a pipeline —
+    and the number of iterations is decided by the model at runtime.</li>
+  <li><strong>Durability.</strong> A deploy mid-conversation must not lose the conversation. State lives in
+    Postgres, not in process memory.</li>
+  <li><strong>Two kinds of memory.</strong> "What did we just say" (this thread) and "what do I know about you"
+    (every thread) are different stores with different lifetimes.</li>
+  <li><strong>Streaming.</strong> Tokens must reach the user while the graph is still running.</li>
+</ul>
+
+<h2 id="prompts">Prompts as assets</h2>
+<p>
+  The system prompt lives in a Markdown file, not in a Python string. That means a prompt change is a
+  content diff, reviewable by someone who does not read Python, and it keeps merge conflicts out of code.
+</p>
+
+<div class="code" data-lang="yaml" data-file="src/agent/prompts/system.md">
+<pre>
+# Name: {agent_name}
+# Role: A world class assistant
+Help the user with their questions.
+
+# Instructions
+- Always be friendly and professional.
+- If you don't know the answer, say you don't know. Don't make up an answer.
+- Try to give the most accurate answer possible.
+
+# What you know about the user
+{long_term_memory}
+
+# Current date and time
+{current_date_and_time}
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="src/agent/prompts/__init__.py">
+<pre>
+def load_system_prompt(**kwargs) -&gt; str:
+    """Read the markdown template and inject runtime values."""
+    prompt_path = os.path.join(os.path.dirname(__file__), "system.md")
+    with open(prompt_path, "r") as f:
+        return f.read().format(
+            agent_name=settings.PROJECT_NAME + " Agent",
+            current_date_and_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **kwargs,                 # long_term_memory arrives from the caller
+        )
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Two sharp edges in those eight lines</span>
+  <p><strong>1.</strong> <code>str.format()</code> treats every <code>{</code> as a placeholder, so a literal
+  brace in the prompt — a JSON example, say — raises <code>KeyError</code> at request time. Escape them as
+  <code>{{</code> or move to a template engine.
+  <strong>2.</strong> The file is re-read on every single call. That is a syscall per request for content that
+  changes weekly; cache it, and gain hot-reload-on-change deliberately rather than by accident.</p>
+</div>
+
+<h3>Why the date is injected</h3>
+<p>
+  Without it the model answers "today" with the date its weights were frozen. One interpolated string removes
+  an entire category of confidently wrong answers.
+</p>
+
+<h2 id="toy-prompt">Toy example: render the system prompt</h2>
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Prompt template renderer</span>
+    <span class="widget-tag">load_system_prompt()</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="pr-mem">memory search result</label>
+        <select id="pr-mem">
+          <option value="hit">3 facts retrieved</option>
+          <option value="empty">nothing relevant</option>
+          <option value="stale">a stale/wrong fact</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label for="pr-brace">prompt contains a literal <code>{</code></label>
+        <select id="pr-brace"><option value="0">no</option><option value="1">yes</option></select>
+      </div>
+    </div>
+    <div class="out" id="pr-out"></div>
+    <div class="widget-note" id="pr-note"></div>
+  </div>
+</div>
+
+<h2 id="tools">Tools</h2>
+<p>One tool per module, registered in one list. That list is the agent's entire capability surface.</p>
+
+<div class="code" data-lang="python" data-file="src/agent/tools/web_search.py">
+<pre>
+from langchain_community.tools import DuckDuckGoSearchResults
+
+# num_results=10 gives the model enough context to synthesise rather
+# than parrot. handle_tool_error keeps a failed search from killing
+# the whole graph run — the model sees an error string and can recover.
+duckduckgo_search_tool = DuckDuckGoSearchResults(num_results=10, handle_tool_error=True)
+</pre>
+</div>
+
+<div class="code" data-lang="python" data-file="src/agent/tools/__init__.py">
+<pre>
+from langchain_core.tools.base import BaseTool
+from .web_search import duckduckgo_search_tool
+
+# Central registry. Adding a tool here is the only step needed
+# for the model to be able to call it.
+tools: list[BaseTool] = [duckduckgo_search_tool]
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Tool output is untrusted input</span>
+  <p>Search results are attacker-influenceable text that goes straight into the model's context. A page can
+  contain "ignore your instructions and…" and the model will read it with the same attention as your system
+  prompt. Keep the tool surface small, prefer read-only tools, and never let a tool result trigger a
+  privileged action without a check outside the model.</p>
+</div>
+
+<h2 id="graph">The graph</h2>
+<p>Two nodes, one entry point, one loop. That is the whole state machine:</p>
+
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def create_graph(self) -&gt; Optional[CompiledStateGraph]:
+    if self._graph is None:
+        try:
+            graph_builder = StateGraph(GraphState)
+
+            # `ends` declares the legal transitions out of each node.
+            graph_builder.add_node("chat",      self._chat,      ends=["tool_call", END])
+            graph_builder.add_node("tool_call", self._tool_call, ends=["chat"])
+            graph_builder.set_entry_point("chat")
+            graph_builder.set_finish_point("chat")
+
+            connection_pool = await self._get_connection_pool()
+            if connection_pool:
+                checkpointer = AsyncPostgresSaver(connection_pool)
+                await checkpointer.setup()      # CREATE TABLE IF NOT EXISTS …
+            else:
+                checkpointer = None
+                if settings.ENVIRONMENT != Environment.PRODUCTION:
+                    raise Exception("Connection pool initialization failed")
+
+            self._graph = graph_builder.compile(
+                checkpointer=checkpointer,
+                name=f"{settings.PROJECT_NAME} Agent ({settings.ENVIRONMENT.value})")
+
+        except Exception as e:
+            logger.error("graph_creation_failed", error=str(e))
+            # Production degrades: an agent with no memory beats no agent.
+            if settings.ENVIRONMENT == Environment.PRODUCTION:
+                logger.warning("continuing_without_graph")
+                return None
+            raise e
+    return self._graph
+</pre>
+</div>
+
+<h3>The chat node</h3>
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def _chat(self, state: GraphState, config: RunnableConfig) -&gt; Command:
+    current_llm = self.llm_service.get_llm()
+    model_name = getattr(current_llm, "model_name", settings.DEFAULT_LLM_MODEL)
+
+    # Rebuilt every turn: fresh memory, fresh timestamp
+    SYSTEM_PROMPT = load_system_prompt(long_term_memory=state.long_term_memory)
+    messages = prepare_messages(state.messages, current_llm, SYSTEM_PROMPT)
+
+    try:
+        # The histogram context manager times the call even if it raises
+        with llm_inference_duration_seconds.labels(model=model_name).time():
+            response_message = await self.llm_service.call(dump_messages(messages))
+
+        response_message = process_llm_response(response_message)
+
+        # THE ROUTING DECISION — made by the model, not by us.
+        if response_message.tool_calls:
+            goto = "tool_call"
+        else:
+            goto = END
+
+        # Command bundles "update the state" and "go here next" atomically
+        return Command(update={"messages": [response_message]}, goto=goto)
+
+    except Exception as e:
+        logger.error("llm_call_failed_all_models", error=str(e))
+        raise Exception(f"failed to get llm response after trying all models: {str(e)}")
+</pre>
+</div>
+
+<h3>The tool node</h3>
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def _tool_call(self, state: GraphState) -&gt; Command:
+    outputs = []
+    # The model may request several tools in one turn
+    for tool_call in state.messages[-1].tool_calls:
+        tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(tool_call["args"])
+        outputs.append(
+            ToolMessage(
+                content=tool_result,
+                name=tool_call["name"],
+                # The id is how the model matches a result to its request.
+                # Drop it and the provider rejects the conversation.
+                tool_call_id=tool_call["id"],
+            )
+        )
+    # Unconditionally back to chat: the model decides whether it now
+    # has enough to answer, or wants another tool.
+    return Command(update={"messages": outputs}, goto="chat")
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Two things this loop does not bound</span>
+  <p><code>tools_by_name[tool_call["name"]]</code> raises <code>KeyError</code> if the model hallucinates a tool
+  name — worth a guard that returns an error <code>ToolMessage</code> instead, so the model can correct itself.
+  And nothing caps the number of chat↔tool round trips; a model that keeps deciding to search will keep
+  searching. Production graphs add a recursion limit and a per-run tool-call budget.</p>
+</div>
+
+<h2 id="toy-graph">Toy example: step the graph</h2>
+<p>
+  Pick a scenario and advance one node at a time. Watch the state grow, the routing decision flip, and the
+  checkpoint get written after every step.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Graph execution stepper</span>
+    <span class="widget-tag">StateGraph</span>
+  </div>
+  <div class="widget-body">
+    <div class="controls">
+      <div class="ctrl">
+        <label for="g-scenario">user asks</label>
+        <select id="g-scenario">
+          <option value="simple">"what is a connection pool?"  (no tool needed)</option>
+          <option value="tool">"what shipped in LangGraph this week?"  (one search)</option>
+          <option value="multi">"compare pgvector and Qdrant pricing"  (two searches)</option>
+        </select>
+      </div>
+      <div class="ctrl">
+        <label>&nbsp;</label>
+        <div class="btn-row">
+          <button class="btn" id="g-step">Execute next node →</button>
+          <button class="btn ghost" id="g-reset">Reset</button>
+        </div>
+      </div>
+    </div>
+    <div class="flow" id="g-flow">
+      <span class="node" data-n="START">START</span><span class="arrow">→</span>
+      <span class="node" data-n="chat">chat</span><span class="arrow">⇄</span>
+      <span class="node" data-n="tool_call">tool_call</span><span class="arrow">→</span>
+      <span class="node" data-n="END">END</span>
+    </div>
+    <div class="two-col">
+      <div>
+        <h4 style="margin-top:0">execution log</h4>
+        <div class="out" id="g-log" style="max-height:280px"></div>
+      </div>
+      <div>
+        <h4 style="margin-top:0">GraphState after this step</h4>
+        <div class="out" id="g-state" style="max-height:280px"></div>
+      </div>
+    </div>
+    <div class="widget-note" id="g-note"></div>
+  </div>
+</div>
+
+<h2 id="memory">Two memories</h2>
+<p>These are frequently confused. They have different stores, different lifetimes and different failure modes.</p>
+
+<table>
+  <thead><tr><th></th><th>Short-term (checkpoints)</th><th>Long-term (mem0ai)</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Scope</strong></td><td>One session / <code>thread_id</code></td><td>One <code>user_id</code>, across every session</td></tr>
+    <tr><td><strong>Store</strong></td><td><code>checkpoints</code> tables, written by AsyncPostgresSaver</td><td>pgvector collection, embeddings + text</td></tr>
+    <tr><td><strong>Contains</strong></td><td>The literal message list and graph position</td><td>LLM-extracted facts: "prefers Python", "based in Dubai"</td></tr>
+    <tr><td><strong>Retrieval</strong></td><td>Exact load by thread id</td><td>Vector similarity against the newest message</td></tr>
+    <tr><td><strong>Written</strong></td><td>Synchronously, after every node</td><td>Asynchronously, after the response is sent</td></tr>
+    <tr><td><strong>Failure mode</strong></td><td>Lost thread = conversation restarts</td><td>Wrong fact = confidently wrong personalisation, persisting for months</td></tr>
+  </tbody>
+</table>
+
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def _long_term_memory(self) -&gt; AsyncMemory:
+    """Lazy singleton — built on first use, not at import."""
+    if self.memory is None:
+        self.memory = await AsyncMemory.from_config(config_dict={
+            "vector_store": {
+                "provider": "pgvector",          # same Postgres as everything else
+                "config": {
+                    "collection_name": settings.LONG_TERM_MEMORY_COLLECTION_NAME,
+                    "dbname":   settings.POSTGRES_DB,
+                    "user":     settings.POSTGRES_USER,
+                    "password": settings.POSTGRES_PASSWORD,
+                    "host":     settings.POSTGRES_HOST,
+                    "port":     settings.POSTGRES_PORT,
+                },
+            },
+            "llm":      {"provider": "openai",
+                         "config": {"model": settings.LONG_TERM_MEMORY_MODEL}},
+            "embedder": {"provider": "openai",
+                         "config": {"model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL}},
+        })
+    return self.memory
+
+
+async def _get_relevant_memory(self, user_id: str, query: str) -&gt; str:
+    try:
+        memory = await self._long_term_memory()
+        results = await memory.search(user_id=str(user_id), query=query)
+        return "\n".join([f"* {result['memory']}" for result in results["results"]])
+    except Exception as e:
+        # Memory is an enhancement, never a dependency. A vector search
+        # failure must not cost the user their answer.
+        logger.error("failed_to_get_relevant_memory", error=str(e), user_id=user_id)
+        return ""
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title"><code>user_id</code> is the tenancy boundary</span>
+  <p>Every <code>search</code> and every <code>add</code> is scoped by it. Get that filter wrong and one user's
+  private facts are injected into another user's system prompt — a cross-tenant leak with no error message,
+  discovered only when someone notices the agent knows something it shouldn't. It deserves a test.</p>
+</div>
+
+<h3>Writing memory without making the user wait</h3>
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+response = await self._graph.ainvoke(
+    input={"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+    config=config,
+)
+
+# Fire and forget: mem0ai runs an LLM to extract durable facts from the
+# transcript. That is a second inference the user should not pay latency for.
+asyncio.create_task(
+    self._update_long_term_memory(
+        user_id, convert_to_openai_messages(response["messages"]), config["metadata"])
+)
+return self.__process_messages(response["messages"])
+</pre>
+</div>
+
+<div class="note warn">
+  <span class="note-title">Bare <code>create_task</code> has two known hazards</span>
+  <p>Nothing holds a reference to the task, so the garbage collector may cancel it mid-flight — the standard
+  fix is to keep the task in a module-level set and discard it in a done-callback. And an exception inside it
+  surfaces only as "Task exception was never retrieved" at shutdown. Here <code>_update_long_term_memory</code>
+  catches everything internally, which handles the second problem but not the first.</p>
+</div>
+
+<h2 id="toy-memory">Toy example: two sessions, one user</h2>
+<p>
+  Session A teaches the agent something. Session B is a brand new thread — empty short-term memory — and the
+  fact still shows up. That gap between the columns is the entire point of long-term memory.
+</p>
+
+<div class="widget">
+  <div class="widget-head">
+    <span class="widget-title">Short-term vs long-term memory</span>
+    <span class="widget-tag">two threads</span>
+  </div>
+  <div class="widget-body">
+    <div class="btn-row" style="margin-bottom:14px">
+      <button class="btn" id="m-step">Next event →</button>
+      <button class="btn ghost" id="m-reset">Reset</button>
+      <span class="dim mono" id="m-count" style="font-size:12px"></span>
+    </div>
+    <div class="two-col">
+      <div>
+        <h4 style="margin-top:0">checkpoints <span class="dim">(per thread_id)</span></h4>
+        <div class="out" id="m-short" style="max-height:250px"></div>
+      </div>
+      <div>
+        <h4 style="margin-top:0">pgvector <span class="dim">(per user_id)</span></h4>
+        <div class="out" id="m-long" style="max-height:250px"></div>
+      </div>
+    </div>
+    <div id="m-note" style="margin-top:14px"></div>
+  </div>
+</div>
+
+<h2 id="streaming">Streaming out of the graph</h2>
+<p>
+  <code>stream_mode="messages"</code> yields token-level chunks as each node produces them, so the first
+  character reaches the browser long before the graph finishes.
+</p>
+
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def get_stream_response(self, messages, session_id, user_id=None) -&gt; AsyncGenerator[str, None]:
+    config = {
+        "configurable": {"thread_id": session_id},
+        "callbacks": [CallbackHandler(environment=settings.ENVIRONMENT.value,
+                                      user_id=user_id, session_id=session_id)],
+        "metadata": {"user_id": user_id, "session_id": session_id, ...},
+    }
+    if self._graph is None:
+        self._graph = await self.create_graph()
+
+    relevant_memory = (await self._get_relevant_memory(
+        user_id, messages[-1].content)) or "No relevant memory found."
+
+    try:
+        async for token, _ in self._graph.astream(
+            {"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+            config, stream_mode="messages",
+        ):
+            try:
+                yield token.content
+            except Exception as token_error:
+                # One malformed chunk must not end the stream
+                logger.error("Error processing token", error=str(token_error))
+                continue
+
+        # Streaming yields tokens, not final state — read it back explicitly.
+        # get_state is sync, so it is wrapped rather than blocking the loop.
+        state: StateSnapshot = await sync_to_async(self._graph.get_state)(config=config)
+        if state.values and "messages" in state.values:
+            asyncio.create_task(self._update_long_term_memory(
+                user_id, convert_to_openai_messages(state.values["messages"]), config["metadata"]))
+
+    except Exception as stream_error:
+        logger.error("Error in stream processing", error=str(stream_error))
+        raise stream_error
+</pre>
+</div>
+
+<h3>History and hard reset</h3>
+<div class="code" data-lang="python" data-file="src/agent/workflow.py">
+<pre>
+async def get_chat_history(self, session_id: str) -&gt; list[Message]:
+    """Replay a conversation straight out of the checkpointer."""
+    state: StateSnapshot = await sync_to_async(self._graph.get_state)(
+        config={"configurable": {"thread_id": session_id}})
+    return self.__process_messages(state.values["messages"]) if state.values else []
+
+
+async def clear_chat_history(self, session_id: str) -&gt; None:
+    conn_pool = await self._get_connection_pool()
+    async with conn_pool.connection() as conn:
+        # settings.CHECKPOINT_TABLES = ["checkpoint_blobs",
+        #                               "checkpoint_writes", "checkpoints"]
+        for table in settings.CHECKPOINT_TABLES:
+            await conn.execute(f"DELETE FROM {table} WHERE thread_id = %s", (session_id,))
+</pre>
+</div>
+
+<div class="note">
+  <span class="note-title">Clearing a thread does not clear the user's memory</span>
+  <p>These deletes only touch checkpoint tables. Facts mem0ai already extracted stay in pgvector, so an agent
+  will still greet the user by name after a "clear history". That is usually what people want, but it is
+  <em>not</em> what a data-deletion request means — right-to-erasure needs a mem0ai delete scoped to the
+  <code>user_id</code> as well.</p>
+</div>
+
+<h2 id="failure">Failure modes this layer prevents</h2>
+<table>
+  <thead><tr><th>Without it</th><th>What you actually see</th><th>The guard</th></tr></thead>
+  <tbody>
+    <tr><td>In-memory state</td><td>Every deploy wipes every in-flight conversation</td><td>AsyncPostgresSaver checkpointing</td></tr>
+    <tr><td>Graph rebuilt per request</td><td><code>CREATE TABLE</code> and pool setup on the hot path</td><td><code>if self._graph is None</code> caching</td></tr>
+    <tr><td>Prompts in Python strings</td><td>Prompt edits need a code review and a release</td><td>Markdown templates + loader</td></tr>
+    <tr><td>No date injected</td><td>The model confidently reports a stale "today"</td><td><code>{current_date_and_time}</code></td></tr>
+    <tr><td>Blocking memory writes</td><td>Every reply waits on a second LLM call</td><td><code>asyncio.create_task(...)</code></td></tr>
+    <tr><td>Memory search raising</td><td>A pgvector hiccup becomes a failed chat</td><td>try/except returning <code>""</code></td></tr>
+    <tr><td>Missing <code>tool_call_id</code></td><td>Provider rejects the whole conversation</td><td>Echoing the id in <code>ToolMessage</code></td></tr>
+    <tr><td>Unbounded tool loop</td><td>A stuck model searches forever on your budget</td><td>Add a recursion limit — not present here</td></tr>
+  </tbody>
+</table>
+
+</main>
+
+<script src="assets/site.js"></script>
+<script>
+const SCENARIOS = {
+  simple: {
+    q: "what is a connection pool?",
+    steps: [
+      { node: "chat", desc: "load prompt + memory, trim history, call LLM", produce: 'AIMessage("A connection pool keeps a fixed set of…")', tools: 0, goto: "END" },
+    ],
+  },
+  tool: {
+    q: "what shipped in LangGraph this week?",
+    steps: [
+      { node: "chat", desc: "LLM decides it needs fresh information", produce: 'AIMessage(tool_calls=[duckduckgo_search_results_json("langgraph release notes")])', tools: 1, goto: "tool_call" },
+      { node: "tool_call", desc: "execute the requested tool, wrap the result", produce: 'ToolMessage(content="[10 results]", tool_call_id="call_a1")', tools: 0, goto: "chat" },
+      { node: "chat", desc: "LLM now has the results and can answer", produce: 'AIMessage("The 1.0.2 release added…")', tools: 0, goto: "END" },
+    ],
+  },
+  multi: {
+    q: "compare pgvector and Qdrant pricing",
+    steps: [
+      { node: "chat", desc: "LLM requests TWO tool calls in one turn", produce: 'AIMessage(tool_calls=[search("pgvector pricing"), search("qdrant cloud pricing")])', tools: 2, goto: "tool_call" },
+      { node: "tool_call", desc: "loop over both calls, one ToolMessage each", produce: 'ToolMessage×2 (tool_call_id="call_b1", "call_b2")', tools: 0, goto: "chat" },
+      { node: "chat", desc: "one source was thin — ask for one more", produce: 'AIMessage(tool_calls=[search("qdrant self-hosted cost")])', tools: 1, goto: "tool_call" },
+      { node: "tool_call", desc: "execute the follow-up search", produce: 'ToolMessage(content="[10 results]", tool_call_id="call_b3")', tools: 0, goto: "chat" },
+      { node: "chat", desc: "enough context — synthesise the comparison", produce: 'AIMessage("pgvector is bundled with Postgres, so…")', tools: 0, goto: "END" },
+    ],
+  },
+};
+
+const MEM_EVENTS = [
+  { t: "Session A · user turn 1", short: 'HumanMessage("I only write Python, never JS")', long: null,
+    note: "The message is checkpointed under <code>thread_id = session-A</code> the moment the node completes." },
+  { t: "Session A · agent replies", short: 'AIMessage("Noted — I\'ll keep examples in Python.")', long: null,
+    note: "Still nothing in pgvector. The memory write has not been triggered yet." },
+  { t: "Background task fires", short: null, long: "prefers Python; dislikes JavaScript",
+    note: "<code>asyncio.create_task(_update_long_term_memory(...))</code> ran after the response was already sent. mem0ai used an LLM to distil the transcript into a durable fact and embedded it." },
+  { t: "Session A · user turn 2", short: 'HumanMessage("show me a retry decorator")', long: null,
+    note: "Same thread, so the full history is still there — the model does not need long-term memory to know the language preference in this session." },
+  { t: "— user closes the tab, comes back tomorrow —", short: null, long: null,
+    note: "New session id. A fresh <code>thread_id</code> means an empty checkpoint." },
+  { t: "Session B · user turn 1", short: 'HumanMessage("how do I parse a CSV?")', long: null, newThread: true,
+    note: "Short-term memory for this thread starts empty. Without long-term memory the agent would have no idea who it is talking to." },
+  { t: "Vector search before the graph runs", short: null, long: null, retrieve: true,
+    note: "<code>_get_relevant_memory(user_id, \"how do I parse a CSV?\")</code> matches the stored fact by similarity and injects it into <code>{long_term_memory}</code>. The agent answers in Python without being told — <strong>in a session that has never heard the word Python.</strong>" },
+];
+
+function pageInit() {
+  /* ============ prompt renderer ============ */
+  function renderPrompt() {
+    const mode = document.getElementById("pr-mem").value;
+    const brace = document.getElementById("pr-brace").value === "1";
+    const mem = {
+      hit: "* prefers Python; dislikes JavaScript\n* based in Dubai (GST+4)\n* works on a FastAPI agent codebase",
+      empty: "No relevant memory found.",
+      stale: "* prefers Python; dislikes JavaScript\n* is a beginner programmer",
+    }[mode];
+    if (brace) {
+      document.getElementById("pr-out").innerHTML =
+`<span class="bad">KeyError: '"role"'</span>
+
+<span class="dim">  File "src/agent/prompts/__init__.py", line 12, in load_system_prompt
+    return f.read().format(agent_name=…, current_date_and_time=…, **kwargs)</span>
+
+<span class="dim">The template contained a literal brace:</span>
+  Return JSON like <span class="warnc">{"role": "user"}</span>
+
+<span class="dim">str.format() read {"role"} as a placeholder name. Escape it as {{"role"}}
+— or stop using str.format for prompts that contain JSON.</span>`;
+      document.getElementById("pr-note").innerHTML =
+        "This fails at <em>request</em> time, not at startup, so it ships green and breaks in production the first time someone edits the prompt to include an example payload.";
+      return;
+    }
+    document.getElementById("pr-out").innerHTML =
+`# Name: <span class="hl">Production Agentic System Agent</span>
+# Role: A world class assistant
+Help the user with their questions.
+
+# Instructions
+- Always be friendly and professional.
+- If you don't know the answer, say you don't know. Don't make up an answer.
+- Try to give the most accurate answer possible.
+
+# What you know about the user
+<span class="${mode === "empty" ? "dim" : mode === "stale" ? "warnc" : "ok"}">${mem}</span>
+
+# Current date and time
+<span class="hl">2026-07-27 11:42:08</span>`;
+    document.getElementById("pr-note").innerHTML = {
+      hit: "Three facts retrieved by vector similarity against the user's newest message. These cost tokens on <em>every</em> turn — memory is not free context.",
+      empty: "The fallback string matters: an empty section reads as an instruction to the model, whereas <code>\"No relevant memory found.\"</code> is unambiguous.",
+      stale: "<strong>The failure mode nobody tests.</strong> \"is a beginner programmer\" was true in March. Nothing expires it, so the agent will keep over-explaining for months. Long-term memory needs a decay or correction policy, not just a write path.",
+    }[mode];
+  }
+  document.getElementById("pr-mem").addEventListener("change", renderPrompt);
+  document.getElementById("pr-brace").addEventListener("change", renderPrompt);
+  renderPrompt();
+
+  /* ============ graph stepper ============ */
+  let gStep = 0, gScenario = "tool";
+  function gRender() {
+    const sc = SCENARIOS[gScenario];
+    const done = gStep >= sc.steps.length;
+    const cur = done ? null : sc.steps[gStep];
+    const active = gStep === 0 ? "START" : done ? "END" : cur.node;
+    $$("#g-flow .node").forEach(n => {
+      n.classList.toggle("active", n.dataset.n === active);
+      n.classList.toggle("done", done && n.dataset.n !== "END");
+    });
+
+    const msgs = ['HumanMessage("' + sc.q + '")', ...sc.steps.slice(0, gStep).map(s => s.produce)];
+    document.getElementById("g-state").innerHTML =
+`GraphState(
+  messages=[
+${msgs.map(m => "    " + (m.length > 58 ? m.slice(0, 58) + "…" : m)).join(",\n")}
+  ],  <span class="dim">len=${msgs.length}</span>
+  long_term_memory=<span class="dim">"* prefers concise answers"</span>
+)
+
+<span class="dim">thread_id = 8f3c…  ·  checkpoint #${gStep}</span>`;
+
+    const log = [];
+    log.push('<span class="dim">graph.astream(input, config, stream_mode="messages")</span>');
+    for (let i = 0; i < gStep; i++) {
+      const s = sc.steps[i];
+      log.push(`<span class="hl">node ${s.node}</span>  <span class="dim">${s.desc}</span>`);
+      if (s.tools) log.push(`  <span class="warnc">→ ${s.tools} tool call(s) requested</span>`);
+      log.push(`  <span class="ok">Command(update={"messages": [...]}, goto="${s.goto}")</span>`);
+      log.push(`  <span class="dim">checkpoint written to postgres (thread_id, step ${i + 1})</span>`);
+    }
+    if (done) log.push('<span class="ok">reached END — final state returned</span>');
+    document.getElementById("g-log").innerHTML = log.join("\n");
+    document.getElementById("g-log").scrollTop = 1e6;
+
+    document.getElementById("g-step").disabled = done;
+    document.getElementById("g-step").textContent = done ? "Finished ✓" : "Execute next node →";
+    document.getElementById("g-note").innerHTML = done
+      ? `Completed in <strong>${sc.steps.length} node execution(s)</strong> and ${sc.steps.filter(s => s.node === "chat").length} LLM call(s). Every step left a checkpoint behind: kill the process at any point and <code>get_state(thread_id)</code> resumes exactly here.`
+      : gStep === 0
+        ? "The graph has not run yet. State holds only the user's message plus whatever the vector search injected."
+        : `Last node routed to <code>${sc.steps[gStep - 1].goto}</code>. That routing was decided by <strong>the model</strong> — <code>if response_message.tool_calls</code> — not by any branch you wrote.`;
+  }
+  document.getElementById("g-scenario").addEventListener("change", e => { gScenario = e.target.value; gStep = 0; gRender(); });
+  document.getElementById("g-step").addEventListener("click", () => { gStep++; gRender(); });
+  document.getElementById("g-reset").addEventListener("click", () => { gStep = 0; gRender(); });
+  gRender();
+
+  /* ============ memory demo ============ */
+  let mStep = 0;
+  function mRender() {
+    const shortA = [], shortB = [], longMem = [];
+    let inB = false, retrieved = false;
+    for (let i = 0; i < mStep; i++) {
+      const e = MEM_EVENTS[i];
+      if (e.newThread) inB = true;
+      if (e.short) (inB ? shortB : shortA).push(e.short);
+      if (e.long) longMem.push(e.long);
+      if (e.retrieve) retrieved = true;
+    }
+    let s = `<span class="dim">thread_id = session-A</span>\n`;
+    s += shortA.length ? shortA.map(m => "  " + m).join("\n") : '  <span class="dim">(empty)</span>';
+    if (inB) {
+      s += `\n\n<span class="dim">thread_id = session-B  ← new thread</span>\n`;
+      s += shortB.length ? shortB.map(m => `  <span class="hl">${m}</span>`).join("\n") : '  <span class="dim">(empty — knows nothing about session A)</span>';
+    }
+    document.getElementById("m-short").innerHTML = s;
+
+    let l = `<span class="dim">collection "agent_memory", user_id = 42</span>\n`;
+    l += longMem.length
+      ? longMem.map(m => `  <span class="ok">▪ ${m}</span>\n    <span class="dim">embedding[1536] · text-embedding-3-small</span>`).join("\n")
+      : '  <span class="dim">(no facts extracted yet)</span>';
+    if (retrieved) {
+      l += `\n\n<span class="dim">search(user_id=42, query="how do I parse a CSV?")</span>\n`;
+      l += `  <span class="hl">→ "* prefers Python; dislikes JavaScript"  (score 0.81)</span>\n`;
+      l += `  <span class="dim">injected into {long_term_memory} of the system prompt</span>`;
+    }
+    document.getElementById("m-long").innerHTML = l;
+
+    document.getElementById("m-count").textContent = `${mStep} / ${MEM_EVENTS.length}`;
+    document.getElementById("m-step").disabled = mStep >= MEM_EVENTS.length;
+    document.getElementById("m-note").innerHTML = mStep === 0
+      ? '<div class="note"><p>Press <em>Next event</em> to follow one user across two sessions.</p></div>'
+      : `<div class="note${mStep === MEM_EVENTS.length ? " ok" : ""}"><span class="note-title">${MEM_EVENTS[mStep - 1].t}</span><p>${MEM_EVENTS[mStep - 1].note}</p></div>`;
+  }
+  document.getElementById("m-step").addEventListener("click", () => { mStep = Math.min(mStep + 1, MEM_EVENTS.length); mRender(); });
+  document.getElementById("m-reset").addEventListener("click", () => { mStep = 0; mRender(); document.getElementById("m-step").disabled = false; });
+  mRender();
+}
+</script>
+</body>
+</html>
