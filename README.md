@@ -21,6 +21,8 @@ git clone https://github.com/FareedKhan-dev/production-grade-agentic-system
 cd production-grade-agentic-system
 ```
 
+> **2026 revision:** the code now fixes several issues in the original version and adds Redis, OpenTelemetry tracing (Tempo, Loki), Alembic migrations and CI. See [Production Upgrades (2026 Revision)](#2026) for what changed, and [`docs/architecture-explorer.html`](docs/architecture-explorer.html) for a clickable map of the architecture.
+
 ## Table of Content
 
 *   [Creating Modular Codebase](#ab61)
@@ -57,6 +59,7 @@ cd production-grade-agentic-system
 *   [Architecture Stress Testing](#f484)
     *   [Simulating our Traffic](#8f52)
     *   [Performance Analysis](#0703)
+*   [Production Upgrades (2026 Revision)](#2026)
 
 ## <a id="ab61"></a>Creating Modular Codebase
 
@@ -3541,3 +3544,88 @@ We can do a bit more complex stress test like gradually increasing load over tim
 **But you can use my Github project to further go deeper into load testing and monitoring your AI-native applications in production.**
 
 > You can [follow me on Medium](https://medium.com/@fareedkhandev) if you find this article useful
+## <a id="2026"></a>Production Upgrades (2026 Revision)
+
+The code in this repository has moved on from some of the snippets above. This chapter lists what changed and why, so you can map the article to the current source. For a clickable map of the whole system (every block links to the file and lines that implement it), open [`docs/architecture-explorer.html`](docs/architecture-explorer.html) in a browser.
+
+### What was broken, and how it is fixed
+
+Reading the code end to end, and checking it against the versions pinned in `uv.lock`, turned up these problems. Each fix has a test in `tests/` unless noted.
+
+| Problem | Effect | Fix |
+|---|---|---|
+| Import paths didn't match the files (`src.interface.api`, `.duckduckgo_search`, `app.main:app`, a `./app` volume) | The app could not start | Paths fixed in `src/main.py`, `src/agent/tools/__init__.py`, the Dockerfile, the Makefile and compose |
+| The streaming path passed Langfuse v2 arguments (`user_id=`, `session_id=` …) to the v3 `CallbackHandler` | Every `/chat/stream` call failed with `TypeError` | `CallbackHandler()` with no arguments; user, session and tags go in `langfuse_user_id`, `langfuse_session_id`, `langfuse_tags` metadata, which is what Langfuse 3.x reads |
+| Login ran `html.escape` on the password before checking a hash of the raw password | Passwords containing `&`, `<`, `>` or `"` registered and then never logged in | Passwords are compared exactly as typed; the email is lowercased at login like at registration |
+| Model fallback replaced the shared, tool-bound model with an unbound one | After one failover the agent lost web search, for every later request in the process | Fallback is per request and remembers nothing; tools are bound to every model in the registry |
+| `APIError` (including 400 and 401) was retried and failed over | A bad request cost 15 API calls and ~20 s before failing | Only rate limits, timeouts, connection errors and 5xx are retried; 400/401/422 fail immediately |
+| The stream forwarded everything LangGraph emitted | Raw DuckDuckGo results and GPT-5 content blocks reached clients; list content crashed the route | Only text from the `chat` node is streamed, extracted from content blocks |
+| One `Message` model (max 3000 characters) served requests, the system prompt and replies | Long replies or a large memory block raised a validation error | `ChatMessage` (client input, capped) and `Message` (output, uncapped); the system prompt is a `SystemMessage` |
+| Clients could send `role: "system"` | Callers could inject system-level instructions | Clients may send `user` and `assistant` only |
+| `docker-compose.yml` shipped a default JWT secret and Grafana used `admin` | Anyone who read the repo could mint tokens | Compose refuses to start without `JWT_SECRET_KEY` and `GRAFANA_ADMIN_PASSWORD`; the app refuses an empty or short secret |
+| `_get_relevant_memory` printed every user's memories to stdout | Personal data in container logs | Removed; recall is logged as a count |
+| Rate limits lived in each process's memory, `RATE_LIMIT_DEFAULT` never applied, session routes had no limit | N workers allowed N× the limit | Counters in Redis, defaults applied through `SlowAPIASGIMiddleware`, limits on every auth route |
+| User tokens and session tokens were interchangeable in format, with no logout | Confusing 404/422 errors; no way to revoke a token | Tokens carry a `typ` claim (`user` or `session`), each route checks it, and `POST /auth/logout` revokes the token in Redis |
+| Sync SQLModel sessions inside `async def` routes, and two separate engines | Every query blocked the event loop; up to 80 connections per process | One async engine (SQLAlchemy + psycopg 3) |
+| Middleware order was the reverse of the comment; metrics used raw paths and stopped at the response headers | Logging context missed some requests; one time series per session id; streams looked instant | Documented order (CORS → logging context → metrics → rate limit); route templates as labels; timing ends at the last body byte |
+| LLM histogram buckets stopped at 5 s | p95 for reasoning models was pinned at 5 s | Buckets up to 120 s (300 s for streams) |
+| Several uvicorn workers each had their own metrics registry | Each scrape saw one random worker | `PROMETHEUS_MULTIPROC_DIR` aggregates all workers |
+| The compose health check called `curl`, which `python:slim` doesn't have | The container was always "unhealthy" | Health check uses the Python standard library |
+| `get_response` swallowed exceptions and returned `None` | Failures surfaced as a pydantic error about `messages` | Errors propagate; clients get a stable 500 message and the logs carry the cause and request id |
+| Memory updates re-sent the whole thread every turn, from an unreferenced task | Growing cost per turn; tasks could be garbage-collected | Only the new turn is sent; tasks are kept until they finish and awaited on shutdown |
+| The production fallback compiled the graph without a checkpointer if Postgres was down | Conversations silently lost their history | The error is raised; `/health/ready` reports the database |
+| Evals: first page of traces only, blocking `sleep` in async code, Langfuse host ignored, `--no-report` crashed | Missed traces, slow runs, wrong project | Pagination up to `EVALUATION_MAX_TRACES`, async backoff and bounded concurrency, host honored, summary fixed |
+| Unused `thread` table, `schema.sql` (SQLite syntax), never-set gauges, an idle Langfuse client | Noise | Removed (a migration drops the empty table) |
+
+### New services and why they are there
+
+```mermaid
+flowchart LR
+  client([Client]) --> app[FastAPI + LangGraph<br/>uvicorn workers]
+  app --> pg[(Postgres + pgvector<br/>users, sessions, checkpoints, memories)]
+  app --> redis[(Redis<br/>rate limits, revoked tokens)]
+  app --> openai[[OpenAI]]
+  app --> langfuse[[Langfuse<br/>LLM traces]]
+  app -- OTLP traces --> otel[OTel Collector]
+  app -. JSON log files .-> otel
+  otel --> tempo[(Tempo)]
+  otel --> loki[(Loki)]
+  prom[(Prometheus)] -- scrape /metrics --> app
+  grafana[Grafana] --> prom & tempo & loki
+```
+
+- **Redis** holds state that every worker and replica must agree on: rate-limit counters and the list of logged-out tokens. If Redis is down, rate limits fall back to per-process memory and the revocation check fails open (logged), so an outage degrades rather than blocks traffic.
+- **OpenTelemetry → Collector → Tempo and Loki.** The app traces every request, SQL query, Redis command and outbound HTTP call (including the OpenAI calls) and sends them to the collector, which forwards traces to Tempo. The collector also tails the app's JSON log files and ships them to Loki. Every log line carries `request_id` and `trace_id`, and Grafana is provisioned so you can jump from a log line to its trace and back. Langfuse still records the LLM side; it is configured to receive only LLM spans, while Tempo sees the whole request.
+- **Alembic migrations** replace `create_all()` and `schema.sql`. The container runs `alembic upgrade head` on start (`RUN_MIGRATIONS=false` turns it off); the first migration adopts tables that an older `create_all()` already made. Use `make migration MSG="..."` after changing a model.
+- **Async database layer.** SQLAlchemy's async engine on psycopg 3, one pool for the process.
+- **Request IDs.** `X-Request-ID` is accepted (if short and plain) or generated, echoed in the response, and attached to every log line.
+- **Health probes.** `/health/live` (process up) and `/health/ready` (database and Redis; `/health` is kept as an alias).
+- **Reproducible image.** A multi-stage Dockerfile installs exactly what `uv.lock` pins, without compilers, as a non-root user.
+- **CI.** `.github/workflows/ci.yml` runs ruff, the test suite, `docker compose config` and an image build on every push and pull request.
+
+### Running it
+
+```bash
+cp .env.example .env.development      # fill in OPENAI_API_KEY, POSTGRES_*, LANGFUSE_*
+export JWT_SECRET_KEY=$(openssl rand -hex 32) GRAFANA_ADMIN_PASSWORD=change-me
+make docker-compose-up ENV=development
+```
+
+| Service | Address |
+|---|---|
+| API and docs | http://localhost:8000/docs |
+| Grafana (dashboard "Agentic API", Explore for traces and logs) | http://localhost:3000 |
+| Prometheus | http://127.0.0.1:9090 |
+
+Local development without Docker: `uv sync --group test`, start Postgres and Redis, then `make migrate`, `make dev`, `make test`, `make lint`.
+
+Settings added in this revision (see `.env.example`): `REDIS_URL`, `RATE_LIMIT_STORAGE_URI`, `MAX_CONTEXT_TOKENS` (history window, separate from `MAX_TOKENS`, which caps a reply), `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, `WEB_CONCURRENCY`, `FORWARDED_ALLOW_IPS` (your proxy's address, so rate limits see real client IPs), `GRAFANA_ADMIN_PASSWORD`, `EVALUATION_CONCURRENCY`, `EVALUATION_MAX_TRACES`.
+
+### API changes for clients
+
+- Tokens issued before this revision have no `typ` claim and are rejected: log in again.
+- `role: "system"` in a chat request is rejected with 422.
+- Send only the new turn in `messages`; the history is stored on the server.
+- A failed stream ends with `{"content": "", "done": true, "error": "..."}`; error details are in the server logs under the response's `X-Request-ID`.
+- `DELETE /auth/session/{id}` also deletes that session's conversation history. Long-term memories are per user and stay.
+- New: `POST /auth/logout`, `GET /health/live`, `GET /health/ready`.
