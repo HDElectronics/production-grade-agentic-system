@@ -2,7 +2,7 @@ install:
 	pip install uv
 	uv sync
 
-DOCKER_COMPOSE ?= docker-compose
+DOCKER_COMPOSE ?= docker compose
 
 set-env:
 	@if [ -z "$(ENV)" ]; then \
@@ -18,15 +18,15 @@ set-env:
 
 prod:
 	@echo "Starting server in production environment"
-	@bash -c "source scripts/set_env.sh production && ./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --loop uvloop"
+	@bash -c "source scripts/set_env.sh production && ./.venv/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop uvloop"
 
 staging:
 	@echo "Starting server in staging environment"
-	@bash -c "source scripts/set_env.sh staging && ./.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --loop uvloop"
+	@bash -c "source scripts/set_env.sh staging && ./.venv/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 8000 --loop uvloop"
 
 dev:
 	@echo "Starting server in development environment"
-	@bash -c "source scripts/set_env.sh development && uv run uvicorn app.main:app --reload --port 8000 --loop uvloop"
+	@bash -c "source scripts/set_env.sh development && uv run uvicorn src.main:app --reload --port 8000 --loop uvloop"
 
 # Evaluation commands
 eval:
@@ -42,7 +42,17 @@ eval-no-report:
 	@bash -c "source scripts/set_env.sh ${ENV:-development} && python -m evals.main --no-report"
 
 lint:
-	ruff check .
+	uvx ruff check src evals tests
+
+test:
+	uv run --group test pytest
+
+migrate:
+	@bash -c "source scripts/set_env.sh ${ENV:-development} && uv run alembic upgrade head"
+
+migration:
+	@if [ -z "$(MSG)" ]; then echo "Usage: make migration MSG='describe the change'"; exit 1; fi
+	@bash -c "source scripts/set_env.sh ${ENV:-development} && uv run alembic revision --autogenerate -m '$(MSG)'"
 
 format:
 	ruff format .
@@ -72,7 +82,7 @@ docker-run:
 		echo "Environment file $$ENV_FILE not found. Please create it."; \
 		exit 1; \
 	fi; \
-	APP_ENV=development $(DOCKER_COMPOSE) --env-file $$ENV_FILE up -d --build db app
+	APP_ENV=development $(DOCKER_COMPOSE) --env-file $$ENV_FILE up -d --build db redis otel-collector app
 
 docker-run-env:
 	@if [ -z "$(ENV)" ]; then \
@@ -88,7 +98,7 @@ docker-run-env:
 		echo "Environment file $$ENV_FILE not found. Please create it."; \
 		exit 1; \
 	fi; \
-	APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file $$ENV_FILE up -d --build db app
+	APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file $$ENV_FILE up -d --build db redis otel-collector app
 	# @./scripts/ensure-db-user.sh $(ENV)
 
 docker-logs:
@@ -105,7 +115,7 @@ docker-logs:
 		echo "Environment file $$ENV_FILE not found. Please create it."; \
 		exit 1; \
 	fi; \
-	APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file $$ENV_FILE logs -f app db
+	APP_ENV=$(ENV) $(DOCKER_COMPOSE) --env-file $$ENV_FILE logs -f app db redis
 
 docker-stop:
 	@if [ -z "$(ENV)" ]; then \
@@ -178,6 +188,9 @@ help:
 	@echo "  eval-quick: Run evaluation with default settings"
 	@echo "  eval-no-report: Run evaluation without generating report"
 	@echo "  test: Run tests"
+	@echo "  lint: Run ruff"
+	@echo "  migrate: Apply database migrations (alembic upgrade head)"
+	@echo "  migration MSG=...: Generate a new migration from model changes"
 	@echo "  clean: Clean up"
 	@echo "  docker-build: Build default Docker image"
 	@echo "  docker-build-env ENV=<environment>: Build Docker image for specific environment"
@@ -185,6 +198,6 @@ help:
 	@echo "  docker-run-env ENV=<environment>: Run Docker container for specific environment"
 	@echo "  docker-logs ENV=<environment>: View logs from running container"
 	@echo "  docker-stop ENV=<environment>: Stop and remove container"
-	@echo "  docker-compose-up: Start the entire stack (API, Prometheus, Grafana)"
+	@echo "  docker-compose-up: Start the entire stack (API, Postgres, Redis, Prometheus, Grafana, Tempo, Loki)"
 	@echo "  docker-compose-down: Stop the entire stack"
 	@echo "  docker-compose-logs: View logs from all services"

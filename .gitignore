@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets and local environment files (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# Runtime output
+logs/
+evals/reports/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

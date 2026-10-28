@@ -1,0 +1,60 @@
+# OpenTelemetry Collector: one entry point for telemetry.
+#   traces: app (OTLP) -> Tempo
+#   logs:   app's JSONL files (filelog) -> Loki (OTLP)
+# Metrics stay on the Prometheus scrape of /metrics.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  filelog:
+    include: [/var/log/app/*.jsonl]
+    start_at: end
+    operators:
+      - type: json_parser
+        severity:
+          parse_from: attributes.level
+        trace:
+          trace_id:
+            parse_from: attributes.trace_id
+          span_id:
+            parse_from: attributes.span_id
+      - type: move
+        if: 'attributes.event != nil'
+        from: attributes.event
+        to: body
+
+processors:
+  batch: {}
+  resource/app:
+    attributes:
+      - key: service.name
+        value: agentic-api
+        action: upsert
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [filelog]
+      processors: [resource/app, batch]
+      exporters: [otlphttp/loki]
