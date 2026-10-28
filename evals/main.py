@@ -124,10 +124,12 @@ def display_summary(report: Dict[str, Any]) -> None:
     print(f"{Fore.CYAN}Model:{Style.RESET_ALL} {report['model']}")
     print(f"{Fore.CYAN}Duration:{Style.RESET_ALL} {report['duration_seconds']} seconds")
     print(f"{Fore.CYAN}Total Traces:{Style.RESET_ALL} {report['total_traces']}")
+    print(f"{Fore.CYAN}Skipped (no messages):{Style.RESET_ALL} {report.get('skipped_traces', 0)}")
 
+    evaluated = report["total_traces"] - report.get("skipped_traces", 0)
     success_rate = 0
-    if report["total_traces"] > 0:
-        success_rate = (report["successful_traces"] / report["total_traces"]) * 100
+    if evaluated > 0:
+        success_rate = (report["successful_traces"] / evaluated) * 100
 
     if success_rate > 80:
         status_color = Fore.GREEN
@@ -137,7 +139,7 @@ def display_summary(report: Dict[str, Any]) -> None:
         status_color = Fore.RED
 
     print(
-        f"{Fore.CYAN}Success Rate:{Style.RESET_ALL} {status_color}{success_rate:.1f}%{Style.RESET_ALL} ({report['successful_traces']}/{report['total_traces']})"
+        f"{Fore.CYAN}Success Rate:{Style.RESET_ALL} {status_color}{success_rate:.1f}%{Style.RESET_ALL} ({report['successful_traces']}/{evaluated})"
     )
 
     print("\n" + f"{Fore.CYAN}Metrics Summary:{Style.RESET_ALL}")
@@ -154,11 +156,12 @@ def display_summary(report: Dict[str, Any]) -> None:
         else:
             status_color = Fore.RED
 
+        direction = "higher is better" if data.get("higher_is_better", True) else "lower is better"
         print(
-            f"  • {metric_name}: {status_color}{success_percent:.1f}%{Style.RESET_ALL} success, avg score: {data['avg_score']:.2f}"
+            f"  • {metric_name}: {status_color}{success_percent:.1f}%{Style.RESET_ALL} success, avg score: {data['avg_score']:.2f} ({direction})"
         )
 
-    if report["generate_report_path"]:
+    if report.get("generate_report_path"):
         print(f"\n{Fore.CYAN}Report generated at:{Style.RESET_ALL} {report['generate_report_path']}")
 
 

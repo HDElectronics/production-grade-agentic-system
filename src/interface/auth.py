@@ -1,11 +1,19 @@
 """Authentication and authorization endpoints for the API.
 
 This module provides endpoints for user registration, login, session management,
-and token verification.
+logout and token verification.
+
+Token kinds (see src/utils/auth.py): register and login return a *user* token;
+POST /session returns a *session* token. Session management routes require a user
+token; the chatbot routes and the per-session routes require a session token.
 """
 
 import uuid
-from typing import List
+from typing import (
+    Any,
+    Dict,
+    List,
+)
 
 from fastapi import (
     APIRouter,
@@ -19,12 +27,9 @@ from fastapi.security import (
     HTTPBearer,
 )
 
+from src.agent.workflow import langgraph_agent
 from src.config.settings import settings
-from src.system.rate_limit import limiter
-from src.system.logs import (
-    bind_context,
-    logger,
-)
+from src.data.db_manager import db_manager
 from src.data.models.session import Session
 from src.data.models.user import User
 from src.data.schemas.auth import (
@@ -33,9 +38,16 @@ from src.data.schemas.auth import (
     UserCreate,
     UserResponse,
 )
-from src.data.db_manager import DatabaseService
+from src.system.logs import (
+    bind_context,
+    logger,
+)
+from src.system.rate_limit import limiter
 from src.utils.auth import (
+    TokenType,
     create_access_token,
+    is_token_revoked,
+    revoke_token,
     verify_token,
 )
 from src.utils.sanitization import (
@@ -46,13 +58,41 @@ from src.utils.sanitization import (
 
 router = APIRouter()
 security = HTTPBearer()
-db_service = DatabaseService()
+db_service = db_manager
+
+_UNAUTHORIZED = {"status_code": 401, "headers": {"WWW-Authenticate": "Bearer"}}
+
+
+async def _claims_from(credentials: HTTPAuthorizationCredentials, expected_type: TokenType | None) -> Dict[str, Any]:
+    """Verify a bearer token's signature, type and revocation status.
+
+    Args:
+        credentials: The bearer credentials from the Authorization header.
+        expected_type: The token kind the route requires, or None for either.
+
+    Returns:
+        Dict[str, Any]: The token's claims.
+
+    Raises:
+        HTTPException: 401 if invalid, of the wrong kind or revoked; 422 if not a JWT.
+    """
+    try:
+        claims = verify_token(credentials.credentials, expected_type)
+    except ValueError as ve:
+        logger.error("token_validation_failed", error=str(ve))
+        raise HTTPException(status_code=422, detail="Invalid token format", headers={"WWW-Authenticate": "Bearer"})
+
+    if claims is None:
+        raise HTTPException(detail="Invalid authentication credentials", **_UNAUTHORIZED)
+    if await is_token_revoked(claims):
+        raise HTTPException(detail="Token has been revoked", **_UNAUTHORIZED)
+    return claims
 
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
-    """Get the current user ID from the token.
+    """Get the current user from a user token.
 
     Args:
         credentials: The HTTP authorization credentials containing the JWT token.
@@ -61,49 +101,28 @@ async def get_current_user(
         User: The user extracted from the token.
 
     Raises:
-        HTTPException: If the token is invalid or missing.
+        HTTPException: If the token is invalid, not a user token, revoked, or the user is gone.
     """
+    claims = await _claims_from(credentials, "user")
     try:
-        # Sanitize token
-        token = sanitize_string(credentials.credentials)
+        user_id = int(claims["sub"])
+    except ValueError:
+        raise HTTPException(detail="Invalid authentication credentials", **_UNAUTHORIZED)
 
-        user_id = verify_token(token)
-        if user_id is None:
-            logger.error("invalid_token", token_part=token[:10] + "...")
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid authentication credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    user = await db_service.get_user(user_id)
+    if user is None:
+        logger.error("user_not_found", user_id=user_id)
+        raise HTTPException(status_code=404, detail="User not found", headers={"WWW-Authenticate": "Bearer"})
 
-        # Verify user exists in database
-        user_id_int = int(user_id)
-        user = await db_service.get_user(user_id_int)
-        if user is None:
-            logger.error("user_not_found", user_id=user_id_int)
-            raise HTTPException(
-                status_code=404,
-                detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        # Bind user_id to logging context for all subsequent logs in this request
-        bind_context(user_id=user_id_int)
-
-        return user
-    except ValueError as ve:
-        logger.error("token_validation_failed", error=str(ve), exc_info=True)
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid token format",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    # Bind user_id to logging context for all subsequent logs in this request
+    bind_context(user_id=user_id)
+    return user
 
 
 async def get_current_session(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> Session:
-    """Get the current session ID from the token.
+    """Get the current chat session from a session token.
 
     Args:
         credentials: The HTTP authorization credentials containing the JWT token.
@@ -112,45 +131,33 @@ async def get_current_session(
         Session: The session extracted from the token.
 
     Raises:
-        HTTPException: If the token is invalid or missing.
+        HTTPException: If the token is invalid, not a session token, revoked, or the session is gone.
     """
-    try:
-        # Sanitize token
-        token = sanitize_string(credentials.credentials)
+    claims = await _claims_from(credentials, "session")
+    session_id = claims["sub"]
 
-        session_id = verify_token(token)
-        if session_id is None:
-            logger.error("session_id_not_found", token_part=token[:10] + "...")
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid authentication credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    session = await db_service.get_session(session_id)
+    if session is None:
+        logger.error("session_not_found", session_id=session_id)
+        raise HTTPException(status_code=404, detail="Session not found", headers={"WWW-Authenticate": "Bearer"})
 
-        # Sanitize session_id before using it
-        session_id = sanitize_string(session_id)
+    # Bind ids to logging context for all subsequent logs in this request
+    bind_context(user_id=session.user_id, session_id=session.id)
+    return session
 
-        # Verify session exists in database
-        session = await db_service.get_session(session_id)
-        if session is None:
-            logger.error("session_not_found", session_id=session_id)
-            raise HTTPException(
-                status_code=404,
-                detail="Session not found",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
 
-        # Bind user_id to logging context for all subsequent logs in this request
-        bind_context(user_id=session.user_id)
+async def get_token_claims(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    """Get the verified claims of a user or session token.
 
-        return session
-    except ValueError as ve:
-        logger.error("token_validation_failed", error=str(ve), exc_info=True)
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid token format",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    Args:
+        credentials: The HTTP authorization credentials containing the JWT token.
+
+    Returns:
+        Dict[str, Any]: The token's claims.
+    """
+    return await _claims_from(credentials, None)
 
 
 @router.post("/register", response_model=UserResponse)
@@ -163,13 +170,13 @@ async def register_user(request: Request, user_data: UserCreate):
         user_data: User registration data
 
     Returns:
-        UserResponse: The created user info
+        UserResponse: The created user info, with a user token
     """
     try:
-        # Sanitize email
+        # Sanitize email (validates format and lowercases it)
         sanitized_email = sanitize_email(user_data.email)
 
-        # Extract and validate password
+        # Passwords are never escaped or altered: they are only hashed
         password = user_data.password.get_secret_value()
         validate_password_strength(password)
 
@@ -181,11 +188,11 @@ async def register_user(request: Request, user_data: UserCreate):
         user = await db_service.create_user(email=sanitized_email, password=User.hash_password(password))
 
         # Create access token
-        token = create_access_token(str(user.id))
+        token = create_access_token(str(user.id), "user")
 
         return UserResponse(id=user.id, email=user.email, token=token)
     except ValueError as ve:
-        logger.error("user_registration_validation_failed", error=str(ve), exc_info=True)
+        logger.error("user_registration_validation_failed", error=str(ve))
         raise HTTPException(status_code=422, detail=str(ve))
 
 
@@ -203,80 +210,84 @@ async def login(
         grant_type: Must be "password"
 
     Returns:
-        TokenResponse: Access token information
+        TokenResponse: A user token
 
     Raises:
         HTTPException: If credentials are invalid
     """
+    if grant_type != "password":
+        raise HTTPException(status_code=400, detail="Unsupported grant type. Must be 'password'")
+
     try:
-        # Sanitize inputs
-        username = sanitize_string(username)
-        password = sanitize_string(password)
-        grant_type = sanitize_string(grant_type)
+        # Same normalization as registration (lowercase), so the stored email matches
+        email = sanitize_email(username)
+    except ValueError:
+        email = None
 
-        # Verify grant type
-        if grant_type != "password":
-            raise HTTPException(
-                status_code=400,
-                detail="Unsupported grant type. Must be 'password'",
-            )
+    # The password is compared exactly as typed: it was hashed unescaped at registration
+    user = await db_service.get_user_by_email(email) if email else None
+    if not user or not user.verify_password(password):
+        raise HTTPException(detail="Incorrect email or password", **_UNAUTHORIZED)
 
-        user = await db_service.get_user_by_email(username)
-        if not user or not user.verify_password(password):
-            raise HTTPException(
-                status_code=401,
-                detail="Incorrect email or password",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    token = create_access_token(str(user.id), "user")
+    return TokenResponse(access_token=token.access_token, token_type="bearer", expires_at=token.expires_at)
 
-        token = create_access_token(str(user.id))
-        return TokenResponse(access_token=token.access_token, token_type="bearer", expires_at=token.expires_at)
-    except ValueError as ve:
-        logger.error("login_validation_failed", error=str(ve), exc_info=True)
-        raise HTTPException(status_code=422, detail=str(ve))
+
+@router.post("/logout")
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["logout"][0])
+async def logout(request: Request, claims: Dict[str, Any] = Depends(get_token_claims)):
+    """Revoke the token used for this request (user or session token).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        claims: The verified claims of the presented token.
+
+    Returns:
+        dict: Confirmation message.
+    """
+    try:
+        await revoke_token(claims)
+    except Exception as e:
+        logger.error("logout_failed", error=str(e))
+        raise HTTPException(status_code=503, detail="Logout is temporarily unavailable")
+    return {"message": "Logged out"}
 
 
 @router.post("/session", response_model=SessionResponse)
-async def create_session(user: User = Depends(get_current_user)):
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["auth_session"][0])
+async def create_session(request: Request, user: User = Depends(get_current_user)):
     """Create a new chat session for the authenticated user.
 
     Args:
+        request: The FastAPI request object for rate limiting.
         user: The authenticated user
 
     Returns:
-        SessionResponse: The session ID, name, and access token
+        SessionResponse: The session ID, name, and a session token
     """
-    try:
-        # Generate a unique session ID
-        session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    session = await db_service.create_session(session_id, user.id)
+    token = create_access_token(session_id, "session")
 
-        # Create session in database
-        session = await db_service.create_session(session_id, user.id)
-
-        # Create access token for the session
-        token = create_access_token(session_id)
-
-        logger.info(
-            "session_created",
-            session_id=session_id,
-            user_id=user.id,
-            name=session.name,
-            expires_at=token.expires_at.isoformat(),
-        )
-
-        return SessionResponse(session_id=session_id, name=session.name, token=token)
-    except ValueError as ve:
-        logger.error("session_creation_validation_failed", error=str(ve), user_id=user.id, exc_info=True)
-        raise HTTPException(status_code=422, detail=str(ve))
+    logger.info(
+        "session_created",
+        session_id=session_id,
+        user_id=user.id,
+        name=session.name,
+        expires_at=token.expires_at.isoformat(),
+    )
+    return SessionResponse(session_id=session_id, name=session.name, token=token)
 
 
 @router.patch("/session/{session_id}/name", response_model=SessionResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["auth_session"][0])
 async def update_session_name(
-    session_id: str, name: str = Form(...), current_session: Session = Depends(get_current_session)
+    request: Request, session_id: str, name: str = Form(...), current_session: Session = Depends(get_current_session)
 ):
     """Update a session's name.
 
     Args:
+        request: The FastAPI request object for rate limiting.
         session_id: The ID of the session to update
         name: The new name for the session
         current_session: The current session from auth
@@ -284,77 +295,61 @@ async def update_session_name(
     Returns:
         SessionResponse: The updated session information
     """
-    try:
-        # Sanitize inputs
-        sanitized_session_id = sanitize_string(session_id)
-        sanitized_name = sanitize_string(name)
-        sanitized_current_session = sanitize_string(current_session.id)
+    # Verify the session ID matches the authenticated session
+    if session_id != current_session.id:
+        raise HTTPException(status_code=403, detail="Cannot modify other sessions")
 
-        # Verify the session ID matches the authenticated session
-        if sanitized_session_id != sanitized_current_session:
-            raise HTTPException(status_code=403, detail="Cannot modify other sessions")
+    session = await db_service.update_session_name(session_id, sanitize_string(name))
 
-        # Update the session name
-        session = await db_service.update_session_name(sanitized_session_id, sanitized_name)
-
-        # Create a new token (not strictly necessary but maintains consistency)
-        token = create_access_token(sanitized_session_id)
-
-        return SessionResponse(session_id=sanitized_session_id, name=session.name, token=token)
-    except ValueError as ve:
-        logger.error("session_update_validation_failed", error=str(ve), session_id=session_id, exc_info=True)
-        raise HTTPException(status_code=422, detail=str(ve))
+    # Create a new token (not strictly necessary but maintains consistency)
+    token = create_access_token(session_id, "session")
+    return SessionResponse(session_id=session_id, name=session.name, token=token)
 
 
 @router.delete("/session/{session_id}")
-async def delete_session(session_id: str, current_session: Session = Depends(get_current_session)):
-    """Delete a session for the authenticated user.
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["auth_session"][0])
+async def delete_session(request: Request, session_id: str, current_session: Session = Depends(get_current_session)):
+    """Delete a session and its conversation history.
+
+    Long-term memories are per user, not per session, so they are kept.
 
     Args:
+        request: The FastAPI request object for rate limiting.
         session_id: The ID of the session to delete
         current_session: The current session from auth
 
     Returns:
-        None
+        dict: Confirmation message.
     """
-    try:
-        # Sanitize inputs
-        sanitized_session_id = sanitize_string(session_id)
-        sanitized_current_session = sanitize_string(current_session.id)
+    # Verify the session ID matches the authenticated session
+    if session_id != current_session.id:
+        raise HTTPException(status_code=403, detail="Cannot delete other sessions")
 
-        # Verify the session ID matches the authenticated session
-        if sanitized_session_id != sanitized_current_session:
-            raise HTTPException(status_code=403, detail="Cannot delete other sessions")
+    await langgraph_agent.clear_chat_history(session_id)
+    await db_service.delete_session(session_id)
 
-        # Delete the session
-        await db_service.delete_session(sanitized_session_id)
-
-        logger.info("session_deleted", session_id=session_id, user_id=current_session.user_id)
-    except ValueError as ve:
-        logger.error("session_deletion_validation_failed", error=str(ve), session_id=session_id, exc_info=True)
-        raise HTTPException(status_code=422, detail=str(ve))
+    logger.info("session_deleted", session_id=session_id, user_id=current_session.user_id)
+    return {"message": "Session deleted"}
 
 
 @router.get("/sessions", response_model=List[SessionResponse])
-async def get_user_sessions(user: User = Depends(get_current_user)):
-    """Get all session IDs for the authenticated user.
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["auth_session"][0])
+async def get_user_sessions(request: Request, user: User = Depends(get_current_user)):
+    """Get all sessions for the authenticated user.
 
     Args:
+        request: The FastAPI request object for rate limiting.
         user: The authenticated user
 
     Returns:
-        List[SessionResponse]: List of session IDs
+        List[SessionResponse]: The user's sessions, each with a fresh session token
     """
-    try:
-        sessions = await db_service.get_user_sessions(user.id)
-        return [
-            SessionResponse(
-                session_id=sanitize_string(session.id),
-                name=sanitize_string(session.name),
-                token=create_access_token(session.id),
-            )
-            for session in sessions
-        ]
-    except ValueError as ve:
-        logger.error("get_sessions_validation_failed", user_id=user.id, error=str(ve), exc_info=True)
-        raise HTTPException(status_code=422, detail=str(ve))
+    sessions = await db_service.get_user_sessions(user.id)
+    return [
+        SessionResponse(
+            session_id=session.id,
+            name=session.name,
+            token=create_access_token(session.id, "session"),
+        )
+        for session in sessions
+    ]

@@ -17,9 +17,25 @@ from langfuse.api.resources.commons.types.trace_with_details import TraceWithDet
 from src.system.logs import logger
 from evals.schemas import ScoreSchema
 
+# Metrics where 1.0 means the problem is fully present
+LOWER_IS_BETTER = {"hallucination", "toxicity"}
+
+
+def _tool_call_arguments(previous: Optional[dict]) -> Optional[str]:
+    """Return the arguments of the first tool call on the message before a tool result."""
+    if not previous:
+        return None
+    calls = previous.get("tool_calls") or previous.get("additional_kwargs", {}).get("tool_calls") or []
+    if not calls:
+        return None
+    first = calls[0]
+    return str(first.get("args") or first.get("function", {}).get("arguments"))
+
 
 def format_messages(messages: list[dict]) -> str:
     """Format a list of messages for evaluation.
+
+    Accepts LangChain-serialized messages (with "type") and OpenAI-style ones (with "role").
 
     Args:
         messages: List of message dictionaries.
@@ -29,14 +45,16 @@ def format_messages(messages: list[dict]) -> str:
     """
     formatted_messages = []
     for idx, message in enumerate(messages):
-        if message["type"] == "tool":
-            formatted_messages.append(
-                f"tool {message.get('name')} input: {messages[idx - 1].get('additional_kwargs', {}).get('tool_calls', [])[0].get('function', {}).get('arguments')} {message.get('content')[:100]}..."
-                if len(message.get("content", "")) > 100
-                else f"tool {message.get('name')}: {message.get('content')}"
-            )
-        elif message["content"]:
-            formatted_messages.append(f"{message['type']}: {message['content']}")
+        kind = message.get("type") or message.get("role")
+        content = message.get("content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        if kind == "tool":
+            args = _tool_call_arguments(messages[idx - 1] if idx > 0 else None)
+            snippet = f"{content[:100]}..." if len(content) > 100 else content
+            formatted_messages.append(f"tool {message.get('name')} input: {args} output: {snippet}")
+        elif content:
+            formatted_messages.append(f"{kind}: {content}")
     return "\n".join(formatted_messages)
 
 
@@ -47,13 +65,14 @@ def get_input_output(trace: TraceWithDetails) -> Tuple[Optional[str], Optional[s
         trace: The trace to extract messages from.
 
     Returns:
-        Tuple of (formatted_input, formatted_output). None if output is not a dict.
+        Tuple of (formatted_input, formatted_output). (None, None) if the trace has no messages.
     """
     if not isinstance(trace.output, dict):
         return None, None
-    input_messages = trace.output.get("messages", [])[:-1]
-    output_message = trace.output.get("messages", [])[-1]
-    return format_messages(input_messages), format_messages([output_message])
+    messages = trace.output.get("messages") or []
+    if not messages:
+        return None, None
+    return format_messages(messages[:-1]), format_messages([messages[-1]])
 
 
 def initialize_report(model_name: str) -> Dict[str, Any]:
@@ -71,6 +90,7 @@ def initialize_report(model_name: str) -> Dict[str, Any]:
         "total_traces": 0,
         "successful_traces": 0,
         "failed_traces": 0,
+        "skipped_traces": 0,
         "duration_seconds": 0,
         "metrics_summary": {},
         "successful_traces_details": [],
@@ -86,7 +106,13 @@ def initialize_metrics_summary(report: Dict[str, Any], metrics: List[Dict[str, s
         metrics: List of metric definitions.
     """
     for metric in metrics:
-        report["metrics_summary"][metric["name"]] = {"success_count": 0, "failure_count": 0, "avg_score": 0.0}
+        report["metrics_summary"][metric["name"]] = {
+            "success_count": 0,
+            "failure_count": 0,
+            "avg_score": 0.0,
+            # For hallucination and toxicity a score of 1 is the worst outcome
+            "higher_is_better": metric["name"] not in LOWER_IS_BETTER,
+        }
 
 
 def update_success_metrics(

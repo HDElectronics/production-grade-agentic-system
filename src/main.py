@@ -1,14 +1,15 @@
 """This file contains the main application entry point."""
 
-import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import (
+    UTC,
+    datetime,
+)
 from typing import (
     Any,
     Dict,
 )
 
-from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     Request,
@@ -17,35 +18,35 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from langfuse import Langfuse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIASGIMiddleware
 
-from src.interface.api import api_router
+from src.agent.workflow import langgraph_agent
 from src.config.settings import settings
-from src.system.rate_limit import limiter
+from src.data.db_manager import db_manager
+from src.interface.router import api_router
+from src.system.cache import (
+    close_redis,
+    redis_health_check,
+)
 from src.system.logs import logger
-from src.system.telemetry import setup_metrics
 from src.system.middleware import (
     LoggingContextMiddleware,
     MetricsMiddleware,
 )
-from src.data.db_manager import db_manager
-
-# Load environment variables
-load_dotenv()
-
-# Initialize Langfuse
-langfuse = Langfuse(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-    host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+from src.system.rate_limit import limiter
+from src.system.telemetry import setup_metrics
+from src.system.tracing import (
+    init_langfuse,
+    setup_tracing,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handle application startup and shutdown events."""
+    settings.validate_runtime()
     logger.info(
         "application_startup",
         project_name=settings.PROJECT_NAME,
@@ -54,6 +55,10 @@ async def lifespan(app: FastAPI):
     )
     yield
     logger.info("application_shutdown")
+    await langgraph_agent.shutdown()
+    await db_manager.dispose()
+    await close_redis()
+    langfuse.flush()
 
 
 app = FastAPI(
@@ -64,14 +69,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Set up Prometheus metrics
+# Tracing first: Langfuse attaches to the TracerProvider that exists when it starts
+setup_tracing(app, db_manager.engine)
+langfuse = init_langfuse()
+
+# Set up Prometheus metrics endpoint
 setup_metrics(app)
-
-# Add logging context middleware (must be added before other middleware to capture context)
-app.add_middleware(LoggingContextMiddleware)
-
-# Add custom metrics middleware
-app.add_middleware(MetricsMiddleware)
 
 # Set up rate limiter exception handler
 app.state.limiter = limiter
@@ -110,13 +113,20 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# Set up CORS middleware
+# Middleware. Starlette runs the LAST added middleware FIRST, so the request passes
+# through them in the reverse order of these calls:
+#   CORS -> LoggingContext -> Metrics -> SlowAPI (default rate limits) -> routes
+app.add_middleware(SlowAPIASGIMiddleware)
+app.add_middleware(MetricsMiddleware)
+app.add_middleware(LoggingContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
+    # Auth uses bearer tokens, not cookies; never combine credentials with a wildcard origin
+    allow_credentials="*" not in settings.ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
 # Include API router
@@ -138,28 +148,39 @@ async def root(request: Request):
     }
 
 
+@app.get("/health/live")
+@limiter.exempt
+async def liveness(request: Request) -> Dict[str, str]:
+    """Liveness probe: the process is up and serving requests."""
+    return {"status": "alive"}
+
+
 @app.get("/health")
-@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["health"][0])
-async def health_check(request: Request) -> Dict[str, Any]:
-    """Health check endpoint with environment-specific information.
+@app.get("/health/ready")
+@limiter.exempt
+async def health_check(request: Request) -> JSONResponse:
+    """Readiness probe with dependency status.
+
+    Postgres is required (503 when down). Redis is optional: without it rate limits
+    fall back to per-process memory and logout is unavailable, so it reports degraded.
 
     Returns:
-        Dict[str, Any]: Health status information
+        JSONResponse: Health status information
     """
-    logger.info("health_check_called")
-
-    # Check database connectivity
     db_healthy = await db_manager.health_check()
+    redis_healthy = await redis_health_check()
 
-    response = {
-        "status": "healthy" if db_healthy else "degraded",
+    response: Dict[str, Any] = {
+        "status": "healthy" if db_healthy and redis_healthy else ("degraded" if db_healthy else "unhealthy"),
         "version": settings.VERSION,
         "environment": settings.ENVIRONMENT.value,
-        "components": {"api": "healthy", "database": "healthy" if db_healthy else "unhealthy"},
-        "timestamp": datetime.now().isoformat(),
+        "components": {
+            "api": "healthy",
+            "database": "healthy" if db_healthy else "unhealthy",
+            "redis": "healthy" if redis_healthy else "unhealthy",
+        },
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
-    # If DB is unhealthy, set the appropriate status code
     status_code = status.HTTP_200_OK if db_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
-
     return JSONResponse(content=response, status_code=status_code)
