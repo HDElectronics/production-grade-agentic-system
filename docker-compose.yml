@@ -1,4 +1,7 @@
-version: '3.8'
+# Full stack: API + Postgres/pgvector + Redis + observability (Prometheus, Grafana,
+# OpenTelemetry Collector, Tempo, Loki, cAdvisor).
+# Required in your shell or --env-file: JWT_SECRET_KEY, GRAFANA_ADMIN_PASSWORD, POSTGRES_*.
+# Data stores bind to 127.0.0.1 only; put a TLS-terminating proxy in front of the app in production.
 
 services:
   db:
@@ -8,13 +11,28 @@ services:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - monitoring
+
+  # Shared state for every API worker: rate-limit counters and revoked tokens
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
       retries: 5
     restart: always
     networks:
@@ -29,59 +47,96 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./app:/app/src
-      - ./logs:/app/logs
+      - app-logs:/app/logs
     env_file:
       - .env.${APP_ENV:-development}
     environment:
       - APP_ENV=${APP_ENV:-development}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-supersecretkeythatshouldbechangedforproduction}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set (openssl rand -hex 32)}
+      - POSTGRES_HOST=db
+      - REDIS_URL=redis://redis:6379/0
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=agentic-api
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).status == 200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 20s
     restart: on-failure
     networks:
       - monitoring
 
-  # Prometheus
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
+  # Receives traces from the app, tails its JSON logs, forwards to Tempo and Loki
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./otel/collector.yaml:/etc/otelcol/config.yaml:ro
+      - app-logs:/var/log/app:ro
+    restart: always
+    networks:
+      - monitoring
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./otel/tempo.yaml:/etc/tempo.yaml:ro
+    restart: always
+    networks:
+      - monitoring
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki-data:/loki
+    restart: always
+    networks:
+      - monitoring
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
     networks:
       - monitoring
     restart: always
 
-  # Grafana
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.3.1
     ports:
       - "3000:3000"
     volumes:
       - grafana-storage:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./grafana/dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}
       - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
     networks:
       - monitoring
     restart: always
 
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:latest
-    ports:
-      - "8080:8080"
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:rw
@@ -99,3 +154,6 @@ networks:
 volumes:
   grafana-storage:
   postgres-data:
+  redis-data:
+  loki-data:
+  app-logs:

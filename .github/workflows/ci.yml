@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies from uv.lock
+        run: uv sync --frozen --group test
+      - name: Lint
+        run: uvx ruff check src evals tests
+      - name: Test
+        run: uv run pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: |
+          touch .env.development
+          JWT_SECRET_KEY=ci GRAFANA_ADMIN_PASSWORD=ci POSTGRES_DB=ci POSTGRES_USER=ci POSTGRES_PASSWORD=ci \
+            docker compose config -q
+      - name: Build image
+        run: docker build -t agentic-api:ci .

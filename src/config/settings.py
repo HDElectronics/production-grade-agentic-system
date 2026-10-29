@@ -16,6 +16,7 @@ from typing import (
     Optional,
     Union,
 )
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -151,7 +152,9 @@ class Settings:
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
         self.DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "gpt-5-mini")
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
+        # MAX_TOKENS caps each reply; MAX_CONTEXT_TOKENS is the history window sent to the model
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
+        self.MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
 
         # Long term memory Configuration
@@ -178,6 +181,14 @@ class Settings:
         self.POSTGRES_MAX_OVERFLOW = int(os.getenv("POSTGRES_MAX_OVERFLOW", "10"))
         self.CHECKPOINT_TABLES = ["checkpoint_blobs", "checkpoint_writes", "checkpoints"]
 
+        # Redis Configuration (shared rate-limit counters and revoked-token list)
+        self.REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.RATE_LIMIT_STORAGE_URI = os.getenv("RATE_LIMIT_STORAGE_URI", self.REDIS_URL)
+
+        # OpenTelemetry Configuration (tracing is off unless an OTLP endpoint is set)
+        self.OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+        self.OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "agentic-api")
+
         # Rate Limiting Configuration
         self.RATE_LIMIT_DEFAULT = parse_list_from_env("RATE_LIMIT_DEFAULT", ["200 per day", "50 per hour"])
 
@@ -190,6 +201,8 @@ class Settings:
             "login": ["20 per minute"],
             "root": ["10 per minute"],
             "health": ["20 per minute"],
+            "auth_session": ["30 per minute"],
+            "logout": ["30 per minute"],
         }
 
         # Update rate limit endpoints from environment variables
@@ -205,9 +218,41 @@ class Settings:
         self.EVALUATION_BASE_URL = os.getenv("EVALUATION_BASE_URL", "https://api.openai.com/v1")
         self.EVALUATION_API_KEY = os.getenv("EVALUATION_API_KEY", self.OPENAI_API_KEY)
         self.EVALUATION_SLEEP_TIME = int(os.getenv("EVALUATION_SLEEP_TIME", "10"))
+        self.EVALUATION_CONCURRENCY = int(os.getenv("EVALUATION_CONCURRENCY", "4"))
+        self.EVALUATION_MAX_TRACES = int(os.getenv("EVALUATION_MAX_TRACES", "500"))
 
         # Apply environment-specific settings
         self.apply_environment_settings()
+
+    @property
+    def POSTGRES_ASYNC_URL(self) -> str:
+        """SQLAlchemy URL for the async engine (psycopg 3 driver)."""
+        return (
+            f"postgresql+psycopg://{quote_plus(self.POSTGRES_USER)}:{quote_plus(self.POSTGRES_PASSWORD)}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
+    @property
+    def POSTGRES_DSN(self) -> str:
+        """Plain libpq connection string for psycopg pools (LangGraph checkpointer)."""
+        return (
+            f"postgresql://{quote_plus(self.POSTGRES_USER)}:{quote_plus(self.POSTGRES_PASSWORD)}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
+
+    def validate_runtime(self) -> None:
+        """Fail fast on settings the API cannot run safely without.
+
+        Called from the FastAPI lifespan rather than at import, so tools that only need
+        configuration (migrations, evals) do not require API secrets.
+
+        Raises:
+            RuntimeError: If the JWT secret is missing, or too short outside development and test.
+        """
+        if not self.JWT_SECRET_KEY:
+            raise RuntimeError("JWT_SECRET_KEY is not set. Generate one with: openssl rand -hex 32")
+        if len(self.JWT_SECRET_KEY) < 32 and self.ENVIRONMENT not in (Environment.DEVELOPMENT, Environment.TEST):
+            raise RuntimeError("JWT_SECRET_KEY must be at least 32 characters outside development and test")
 
     def apply_environment_settings(self):
         """Apply environment-specific settings based on the current environment."""

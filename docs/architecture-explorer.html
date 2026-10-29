@@ -1,0 +1,1752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Agentic System Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..900&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one wide explorer figure (diagram + sticky detail panel), a short findings list under it.
+   Block colour = who owns the block; arrow colour = what kind of value travels. */
+:root {
+  --bg: #F2F3F7; --surface: #FFFFFF; --surface-2: #E7E9F0; --ink: #141826; --muted: #586079; --line: #D5D9E3;
+  --http: #4338CA; --http-soft: #E3E3FA; --auth: #A85A08; --msg: #0B7A6B; --msg-soft: #D6EFEA;
+  --llm: #B4237A; --sql: #66701A; --bad: #B42318; --bad-soft: #FBE3E0;
+  --video: var(--http); --action: var(--auth); --state: var(--msg); --grad: var(--llm);
+  --warn-soft: #FAEFD9; --on-accent: #FFFFFF;
+  --font-display: "Archivo", "Arial Narrow", "Helvetica Neue", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0E1119; --surface: #161A26; --surface-2: #1E2333; --ink: #E6E8F1; --muted: #9AA2B8; --line: #2B3247;
+    --http: #A5A7FF; --http-soft: #24274B; --auth: #F0A64E; --msg: #4CC8B4; --msg-soft: #123430;
+    --llm: #F27BB8; --sql: #C4CF62; --bad: #F7836F; --bad-soft: #3B1A17;
+    --warn-soft: #33280F; --on-accent: #0E1119;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0E1119; --surface: #161A26; --surface-2: #1E2333; --ink: #E6E8F1; --muted: #9AA2B8; --line: #2B3247;
+  --http: #A5A7FF; --http-soft: #24274B; --auth: #F0A64E; --msg: #4CC8B4; --msg-soft: #123430;
+  --llm: #F27BB8; --sql: #C4CF62; --bad: #F7836F; --bad-soft: #3B1A17;
+  --warn-soft: #33280F; --on-accent: #0E1119;
+  color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 16px/1.6 var(--font-body); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 96rem; margin: 0 auto; padding-block: 2.25rem 4rem; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+h1 { font: 800 clamp(1.7rem, 3.4vw, 2.5rem)/1.1 var(--font-display); font-stretch: 112%; margin: 0.3rem 0 0.6rem; text-wrap: balance; }
+h2 { font: 750 1.35rem/1.2 var(--font-display); font-stretch: 108%; margin: 0 0 0.4rem; text-wrap: balance; }
+h3, h4 { font-family: var(--font-display); }
+.lede { max-width: 46rem; color: var(--muted); margin: 0 0 1.4rem; }
+.eyebrow { font: 600 0.74rem/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--http); }
+code, kbd { font-family: var(--font-mono); font-size: 0.86em; background: var(--surface-2); padding: 0.08em 0.35em; border-radius: 4px; }
+a { color: var(--http); }
+.btn { font: 600 0.84rem/1 var(--font-body); padding: 0.55rem 0.8rem; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; display: inline-flex; align-items: center; gap: 0.4rem; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--http); color: var(--on-accent); border-color: var(--http); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button { font: 500 0.82rem/1 var(--font-mono); padding: 0.5rem 0.75rem; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+:focus-visible { outline: 2px solid var(--http); outline-offset: 2px; border-radius: 4px; }
+.note { font-size: 0.84rem; color: var(--muted); margin: 0.75rem 0 0; max-width: 60rem; }
+
+/* architecture guide under the figure: sticky contents on the left, reading column on the right */
+.guide { margin-top: 3rem; display: grid; grid-template-columns: 13.5rem minmax(0, 1fr); gap: 0 3rem; align-items: start; }
+.guide-head { grid-column: 1 / -1; max-width: 46rem; margin-bottom: 1.6rem; }
+.guide-head .lede { margin-bottom: 0; }
+.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 1rem); font-size: 0.86rem; border-left: 2px solid var(--line); padding-left: 0.9rem; }
+.toc b { display: block; font: 700 0.66rem/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 0.6rem; }
+.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
+.toc a { color: var(--ink); text-decoration: none; }
+.toc a:hover { color: var(--http); text-decoration: underline; }
+.chapters { min-width: 0; display: flex; flex-direction: column; gap: 2.6rem; }
+.chapter { max-width: 46rem; min-width: 0; scroll-margin-top: 1rem; }
+.chapter h3 { font: 750 1.22rem/1.25 var(--font-display); font-stretch: 106%; margin: 0 0 0.25rem; text-wrap: balance; }
+.chapter .kick { font: 600 0.7rem/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--http); margin: 0 0 0.5rem; }
+.chapter p { margin: 0.65rem 0 0; }
+.chapter ul, .chapter ol.steps { margin: 0.65rem 0 0; padding-left: 1.2rem; display: flex; flex-direction: column; gap: 0.35rem; }
+.chapter li::marker { color: var(--muted); }
+.tbl { margin-top: 0.9rem; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.tbl table { border-collapse: collapse; width: 100%; min-width: 38rem; font-size: 0.86rem; line-height: 1.45; }   /* scroll sideways on phones instead of squeezing columns */
+.tbl th { text-align: left; font: 600 0.66rem/1.2 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.tbl td { padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl td:first-child { font-weight: 600; min-width: 8.5rem; }
+.yours { margin-top: 1rem; padding: 0.75rem 0.95rem; border-radius: 10px; background: var(--http-soft); font-size: 0.92rem; }
+.yours b { display: block; font: 700 0.66rem/1.2 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--http); margin-bottom: 0.3rem; }
+.yours p { margin: 0.35rem 0 0; }
+.yours p:first-of-type { margin-top: 0; }
+.trade { margin-top: 0.8rem; padding-left: 0.9rem; border-left: 3px solid var(--auth); font-size: 0.92rem; color: var(--ink); }
+.see { margin-top: 0.9rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; font-size: 0.8rem; color: var(--muted); }
+.goto { font: 500 0.78rem/1 var(--font-body); padding: 0.4rem 0.6rem; border-radius: 7px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; }
+.goto:hover { border-color: var(--http); color: var(--http); }
+.goto::before { content: "↗ "; color: var(--http); }
+ol.steps { counter-reset: none; }
+ol.steps li { padding-left: 0.2rem; }
+ol.steps li b { font-weight: 600; }
+@media (max-width: 900px) {
+  .guide { grid-template-columns: minmax(0, 1fr); }
+  .toc { position: static; margin-bottom: 2rem; }
+}
+.ax-svg .nd .ns { white-space: pre; }   /* keep column spacing in multi-line subtitles */
+.ax-fig pre { margin: 0; font: 500 0.72rem/1.5 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
+
+/* ---------- architecture explorer (ArchExplorer) ---------- */
+:root { --ax-sub: #4A5368; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --ax-sub: #A9B1C6; } }
+:root[data-theme="dark"] { --ax-sub: #A9B1C6; }
+.ax { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
+.ax .muted { color: var(--muted); }
+.ax-top { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; padding: 0.7rem 1rem; border-bottom: 1px solid var(--line); }
+.ax-crumbs { display: flex; align-items: center; gap: 0.15rem; flex-wrap: wrap; font: 600 0.84rem/1 var(--font-body); min-width: 0; }
+.ax-crumbs button { border: 0; background: none; color: var(--video); cursor: pointer; padding: 0.4rem 0.45rem; border-radius: 6px; font: inherit; }
+.ax-crumbs button:hover { background: var(--surface-2); }
+.ax-crumbs button[aria-current] { color: var(--ink); cursor: default; background: none; }
+.ax-crumbs .sep { color: var(--muted); }
+.ax-tools { margin-left: auto; display: flex; gap: 0.6rem 1rem; align-items: center; flex-wrap: wrap; min-width: 0; }
+.ax-tog { font-size: 0.82rem; color: var(--muted); display: inline-flex; gap: 0.35rem; align-items: center; cursor: pointer; white-space: nowrap; }
+.ax-tog input { accent-color: var(--video); }
+.ax-find { position: relative; min-width: 0; }
+.ax-find input { font: 400 0.84rem/1.2 var(--font-body); padding: 0.45rem 0.7rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--ink); width: 16rem; max-width: 100%; }
+.ax-hits { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; width: 21rem; max-width: calc(100vw - 32px); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2); padding: 0.3rem; display: flex; flex-direction: column; }
+.ax-hits button { text-align: left; border: 0; background: none; color: var(--ink); padding: 0.45rem 0.55rem; border-radius: 7px; cursor: pointer; display: flex; flex-direction: column; gap: 0.1rem; font: 500 0.84rem/1.3 var(--font-body); }
+.ax-hits button:hover, .ax-hits button:focus-visible { background: var(--surface-2); }
+.ax-hits span { font: 400 0.72rem/1.2 var(--font-mono); color: var(--muted); }
+.ax-hits .none { margin: 0; padding: 0.5rem; color: var(--muted); font-size: 0.84rem; }
+
+.ax-main { display: grid; grid-template-columns: minmax(0, 1fr) 25rem; min-width: 0; }
+.ax-left { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+.ax-stage { overflow-x: auto; -webkit-overflow-scrolling: touch; flex: 1 1 auto; }
+.ax-svg { display: block; width: 100%; height: auto; stroke: none; }
+.ax-fig svg { stroke: none; }   /* host pages may set stroke on a parent; SVG text would inherit it */
+.ax-side { position: relative; min-width: 0; }
+.ax-panel { position: absolute; inset: 0; overflow-y: auto; padding: 1rem 1.15rem 1.4rem; display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.9rem; line-height: 1.55; }
+.ax-panel:focus { outline: none; }
+@media (max-width: 1080px) {
+  /* narrow: the detail panel becomes a bottom sheet that stays in view while the diagram scrolls */
+  .ax-main { grid-template-columns: minmax(0, 1fr); }
+  .ax-left { border-right: 0; }
+  .ax-side { position: sticky; bottom: 0; z-index: 3; max-height: 46vh; overflow-y: auto; background: var(--surface); border-top: 2px solid var(--line); box-shadow: 0 -10px 24px rgba(0, 0, 0, 0.12); }
+  .ax-panel { position: static; overflow: visible; }
+}
+
+/* svg: groups, blocks, arrows */
+.ax-svg text { font-family: var(--font-body); }
+.ax-bg { fill: transparent; }
+.ax-svg .grp rect { fill: var(--bg); stroke: var(--line); stroke-width: 1; }
+.ax-svg .grp .gt { font: 700 10.5px var(--font-mono); letter-spacing: 0.07em; text-transform: uppercase; fill: var(--ax-sub); }
+.ax-svg .grp .gs { font: 500 10.5px var(--font-mono); text-transform: none; letter-spacing: 0; }
+.ax-svg .ax-note { font: 500 10.5px var(--font-mono); fill: var(--ax-sub); }
+.ax-svg .ax-note.em { fill: var(--ink); font-weight: 600; }
+.nd { cursor: pointer; outline: none; }
+.nd .bx { stroke-width: 1.4; transition: stroke-width 0.12s; }
+.nd .nt { font: 600 12.5px var(--font-body); fill: var(--ink); }
+.nd .ns { font: 500 10.5px var(--font-mono); fill: var(--ax-sub); }
+.nd .glyph { stroke: var(--muted); stroke-width: 1.3; fill: none; }
+.nd .glyph rect { fill: var(--muted); stroke: none; }
+.nd .glyph.lock rect.lkbg { fill: var(--surface); stroke: var(--muted); stroke-width: 1; }
+.nd .glyph.open { stroke: var(--ink); stroke-width: 1.5; }
+.nd.drill .bx { stroke-width: 2.2; }
+.nd:hover .bx { stroke-width: 2.6; }
+.nd:focus-visible .bx { stroke: var(--ink); stroke-width: 2.8; }
+.nd.sel .bx { stroke: var(--ink); stroke-width: 3; }
+.nd.on .bx { stroke-width: 3; }
+.ax-badge rect { fill: var(--grad); }
+.ax-badge text { font: 700 9.5px var(--font-mono); fill: var(--on-accent); }
+.ed { cursor: pointer; color: var(--muted); outline: none; }
+.ed .hit { stroke: transparent; stroke-width: 14; fill: none; pointer-events: stroke; }
+.ed .ln { stroke: currentColor; stroke-width: 1.7; fill: none; stroke-linejoin: round; stroke-linecap: round; }
+.ed.dashed .ln { stroke-dasharray: 5 4; }
+.ed .hd { fill: currentColor; }
+.ed:hover .ln, .ed:focus-visible .ln { stroke-width: 3; }
+.ed.sel .ln, .ed.on .ln { stroke-width: 3.2; stroke-dasharray: 7 5; animation: ax-flow 0.9s linear infinite; }
+@keyframes ax-flow { to { stroke-dashoffset: -24; } }
+@media (prefers-reduced-motion: reduce) { .ed.sel .ln, .ed.on .ln { animation: none; } }
+.ax-lab { cursor: pointer; }
+.ax-lab rect { fill: var(--surface); stroke: currentColor; stroke-width: 1; }
+.ax-lab text { font: 500 10px var(--font-mono); fill: var(--ink); }
+.ax-lab.lit rect { stroke-width: 2; }
+.noshapes .labels .ax-lab:not(.lit) { display: none; }
+.ax-svg.focus .nd:not(.sel):not(.rel):not(.on),
+.ax-svg.focus .ed:not(.sel):not(.rel):not(.on),
+.ax-svg.focus .labels .ax-lab:not(.lit) { opacity: 0.28; }
+.ax-svg.focus .grp, .ax-svg.focus .ax-note { opacity: 0.6; }
+.nd, .ed, .ax-lab { transition: opacity 0.15s; }
+
+/* detail panel */
+.ax-panel > * { flex-shrink: 0; }   /* long details scroll; nothing gets squashed */
+.ax-panel h3 { margin: 0; font-size: 1.16rem; line-height: 1.25; }
+.ax-panel p { margin: 0; }
+.ax-panel h4 { font: 700 0.7rem/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin: 0.55rem 0 0; }
+.ax-kind { font: 700 0.7rem/1 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.ax-tags { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.ax-tags li { font: 500 0.74rem/1.2 var(--font-mono); padding: 0.3rem 0.45rem; border-radius: 6px; background: var(--surface-2); font-variant-numeric: tabular-nums; }
+.ax-tbl { overflow-x: auto; }
+.ax-tbl table { border-collapse: collapse; width: 100%; font-size: 0.8rem; line-height: 1.35; }
+.ax-tbl th { text-align: left; font: 600 0.66rem/1 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--line); }
+.ax-tbl td { padding: 0.35rem 0.4rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.ax-tbl td code { white-space: nowrap; font-size: 0.74rem; overflow-wrap: normal; }
+.ax-tbl td:last-child { font: 400 0.72rem/1.35 var(--font-mono); color: var(--muted); }
+.ax-tbl .dir { font: 700 0.64rem/1.6 var(--font-mono); text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+.ax-tbl .io-out { color: var(--action); }
+.ax-tbl .io-in { color: var(--video); }
+.ax-code { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.ax-code li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.15rem 0.5rem; font-size: 0.8rem; }
+.ax-code a, .ax-code code { font: 500 0.76rem/1.35 var(--font-mono); overflow-wrap: anywhere; color: var(--video); background: none; padding: 0; }
+.ax-code .sym { font: 400 0.75rem/1.35 var(--font-mono); color: var(--ink); flex-basis: 100%; }
+.ax-code .cn { flex-basis: 100%; color: var(--muted); font-size: 0.8rem; line-height: 1.4; }
+.ax-copy { font: 600 0.64rem/1 var(--font-mono); border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 5px; padding: 0.2rem 0.35rem; cursor: pointer; }
+.ax-copy:hover { color: var(--ink); border-color: var(--muted); }
+.ax-mode { border-left: 3px solid var(--line); padding: 0.4rem 0.7rem; background: var(--bg); border-radius: 0 8px 8px 0; font-size: 0.86rem; }
+.ax-mode.cur { border-left-color: var(--video); }
+.ax-mode b { display: block; font: 700 0.66rem/1.4 var(--font-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.ax-params { font-size: 0.84rem; }
+.ax-acts, .ax-conns, .ax-ends { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+.ax-link { text-align: left; font: 500 0.8rem/1.3 var(--font-body); border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 8px; padding: 0.38rem 0.55rem; cursor: pointer; max-width: 100%; }
+.ax-link span { color: var(--muted); font-size: 0.74rem; }
+.ax-link:hover { border-color: var(--muted); }
+.ax-link.primary { background: var(--video); color: var(--on-accent); border-color: var(--video); font-weight: 600; }
+.ax-warn { background: var(--warn-soft); border-radius: 8px; padding: 0.5rem 0.7rem; font-size: 0.84rem; }
+.ax-hint { color: var(--muted); font-size: 0.82rem; }
+.ax-fig { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 0.6rem; overflow-x: auto; }
+.ax-fig svg { display: block; width: 100%; height: auto; }
+.ax-fig figcaption, .ax-fig .cap { font-size: 0.76rem; color: var(--muted); margin-top: 0.35rem; }
+
+/* walk-through */
+.ax-trace { padding: 0.65rem 1rem 0.8rem; background: var(--surface-2); border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 0.45rem; }
+.ax-tbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.6rem; }
+.ax-tbar .btn { padding: 0.45rem 0.65rem; }
+.ax-tbar .btn svg { width: 0.7rem; height: 0.7rem; fill: currentColor; }
+.ax-tbar .btn:disabled { opacity: 0.4; cursor: default; }
+.ax-tlabel { font: 700 0.7rem/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.ax-tnum { font: 600 0.78rem/1 var(--font-mono); color: var(--muted); font-variant-numeric: tabular-nums; min-width: 5.5rem; }
+.ax-dots { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.ax-dots button { display: block; width: 1.05rem; height: 0.55rem; border-radius: 3px; border: 0; background: var(--line); cursor: pointer; padding: 0; }
+.ax-dots button.done { background: var(--muted); }
+.ax-dots button[aria-current="step"] { background: var(--video); width: 1.7rem; }
+.ax-tcap { font-size: 0.9rem; line-height: 1.5; min-height: 3em; max-width: 60rem; }
+.ax-tcap b { font-weight: 700; margin-right: 0.3rem; }
+.ax-legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; padding: 0.65rem 1rem; border-top: 1px solid var(--line); font-size: 0.76rem; color: var(--muted); align-items: center; }
+.ax-legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.ax-legend .ax-lg-h { font: 700 0.66rem/1 var(--font-mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink); }
+.ax-legend .ax-lg-h:not(:first-child) { margin-left: 0.6rem; }
+.ax-sw { width: 0.95rem; height: 0.7rem; border-radius: 3px; display: inline-block; flex: none; }
+.ax-swl { height: 3px; border-radius: 2px; background: currentColor; }
+.ax-fig table.mini { border-collapse: collapse; width: 100%; font-size: 0.76rem; line-height: 1.35; }
+.ax-fig table.mini th { text-align: left; font: 600 0.64rem/1.2 var(--font-mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; padding: 0.25rem 0.35rem; border-bottom: 1px solid var(--line); }
+.ax-fig table.mini td { padding: 0.3rem 0.35rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.ax-fig table.mini td:last-child { font-family: var(--font-mono); font-size: 0.72rem; white-space: nowrap; }
+</style>
+</head>
+<body>
+<main class="wrap">
+  <span class="eyebrow">production-grade-agentic-system · architecture</span>
+  <h1>How a chat message moves through the agent</h1>
+  <p class="lede">Click any block or arrow to see what it does, the values it passes, and the file and lines that implement it. Blocks marked ⤢ open an inside view. The switch at the top left changes between the blocking and the streaming chat endpoint. The walk-through under the diagram follows one request, one step at a time.</p>
+  <figure class="ax" id="arch" style="margin:0"></figure>
+  <p class="note">Keys: <kbd>Tab</kbd> moves between blocks and arrows, <kbd>Enter</kbd> selects, <kbd>Shift</kbd>+<kbd>Enter</kbd> or double-click opens an inside view, <kbd>Esc</kbd> clears or goes up a level, <kbd>←</kbd> <kbd>→</kbd> step the walk-through. Values are Python types and wire formats. Code links open the file on GitHub's <code>master</code> branch. The API prefix <code>/api/v1</code> comes from <code>.env.example</code> (the code default is <code>/api</code>).</p>
+
+  <section class="guide" aria-labelledby="guide-h">
+    <header class="guide-head">
+      <h2 id="guide-h">Why it is built this way</h2>
+      <p class="lede">The diagram shows what each part does. This guide explains the decisions behind it: where each kind of state lives, how failures are handled, and what each piece of infrastructure is for. Each section ends with what to keep in mind if you build a similar system, and the buttons jump to the matching block above.</p>
+    </header>
+
+    <nav class="toc" aria-label="Guide contents">
+      <b>Contents</b>
+      <ol>
+        <li><a href="#g-layers">The layers</a></li>
+        <li><a href="#g-identity">Users, sessions, tokens</a></li>
+        <li><a href="#g-state">Where state lives</a></li>
+        <li><a href="#g-loop">The agent loop</a></li>
+        <li><a href="#g-memory">Short- and long-term memory</a></li>
+        <li><a href="#g-models">Calling models</a></li>
+        <li><a href="#g-stream">Streaming</a></li>
+        <li><a href="#g-protect">Protecting the API</a></li>
+        <li><a href="#g-observe">Observability</a></li>
+        <li><a href="#g-ops">Running it</a></li>
+        <li><a href="#g-evals">Evaluation</a></li>
+        <li><a href="#g-build">Build your own, in order</a></li>
+      </ol>
+    </nav>
+
+    <div class="chapters">
+      <article class="chapter" id="g-layers">
+        <p class="kick">Structure</p>
+        <h3>The layers, and why they are separate</h3>
+        <p>The code is split by responsibility. Each layer calls only the ones below it, so the HTTP code never talks to OpenAI and the agent never parses a request.</p>
+        <div class="tbl"><table>
+          <thead><tr><th>Directory</th><th>Owns</th><th>Knows nothing about</th></tr></thead>
+          <tbody>
+            <tr><td>src/interface</td><td>Routes, auth dependencies, status codes</td><td>Models, prompts, graph internals</td></tr>
+            <tr><td>src/agent</td><td>The LangGraph graph, prompts, tools, memory</td><td>HTTP, tokens</td></tr>
+            <tr><td>src/services</td><td>Model access: registry, retries, fallback</td><td>Conversations, users</td></tr>
+            <tr><td>src/data</td><td>Tables (SQLModel), request and response schemas, the database service</td><td>The agent</td></tr>
+            <tr><td>src/system</td><td>Logging, metrics, tracing, rate limits, the Redis client</td><td>Business logic</td></tr>
+            <tr><td>src/config</td><td>One <code>settings</code> object read from the environment</td><td>Everything else</td></tr>
+          </tbody>
+        </table></div>
+        <p>The payoff is replaceability. Swapping OpenAI for another provider touches <code>src/services</code> only; moving off Postgres touches <code>src/data</code>. It also makes testing cheap: the test suite replaces the database with an in-memory fake and the models with scripted doubles, without starting any infrastructure.</p>
+        <div class="yours"><b>Building your own</b><p>Draw these boundaries on day one, even when each layer is a single file. The expensive mistake is a route handler that builds prompts and calls the model directly: it can't be tested, traced or reused from a worker or a CLI.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="mw">HTTP stack</button><button type="button" class="goto" data-goto="agent">Agent</button><button type="button" class="goto" data-goto="llmsvc">LLM service</button><button type="button" class="goto" data-goto="dbsvc">Database service</button></p>
+      </article>
+
+      <article class="chapter" id="g-identity">
+        <p class="kick">Identity</p>
+        <h3>Users, sessions, and two kinds of token</h3>
+        <p>A user owns many chat sessions, and each session is one LangGraph thread: its id is used as <code>thread_id</code>, so the session is also the key of the conversation history. Authentication follows that shape. Register and login return a <b>user token</b>, which can only manage sessions. <code>POST /auth/session</code> returns a <b>session token</b>, which is the only kind the chat routes accept.</p>
+        <p>This gives every chat request exactly one conversation, decided by the server rather than by a field the client could change, and it limits the damage of a leaked chat token to one conversation. The two kinds share one JWT format and are told apart by a <code>typ</code> claim that every route checks. Each token also has a random <code>jti</code>; logging out writes that id to Redis until the token would have expired, and every route looks it up.</p>
+        <p class="trade">Trade-off: JWTs avoid a database read to check a signature, but revocation needs a shared store. If Redis is down, the check lets tokens through and logs an error, choosing availability. A system with stricter requirements would refuse the request instead.</p>
+        <div class="yours"><b>Building your own</b><p>Decide early what a "conversation" is and make it the unit of authorization. Put the token kind in the token, and give tokens an id from the start; adding revocation later is much harder than adding it to an empty system.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="sess">Create a session</button><button type="button" class="goto" data-goto="jwt">Token claims</button><button type="button" class="goto" data-goto="sessdep">Session check</button><button type="button" class="goto" data-goto="logout">Logout</button></p>
+      </article>
+
+      <article class="chapter" id="g-state">
+        <p class="kick">State</p>
+        <h3>Where each kind of state lives</h3>
+        <p>The API processes keep nothing between requests that another process would need. Everything shared is in Postgres or Redis, so you can run several uvicorn workers and several containers behind a load balancer, and restart any of them.</p>
+        <div class="tbl"><table>
+          <thead><tr><th>State</th><th>Store</th><th>Lives for</th><th>Why there</th></tr></thead>
+          <tbody>
+            <tr><td>Users, sessions</td><td>Postgres tables</td><td>Until deleted</td><td>Relational data with unique emails and foreign keys</td></tr>
+            <tr><td>Conversation history</td><td>LangGraph checkpoints (Postgres)</td><td>Until the session is deleted</td><td>Written after every graph step; the thread can be resumed and inspected</td></tr>
+            <tr><td>Long-term memory</td><td>mem0 in pgvector (Postgres)</td><td>Per user, across sessions</td><td>Recalled by meaning, through vector similarity</td></tr>
+            <tr><td>Rate-limit counters</td><td>Redis</td><td>Seconds to hours</td><td>Fast increments with expiry, shared by every worker</td></tr>
+            <tr><td>Revoked tokens</td><td>Redis, append-only file</td><td>Until the token expires</td><td>Read on every request, must survive a restart</td></tr>
+            <tr><td>Compiled graph, pools, bound models</td><td>Process memory</td><td>The process</td><td>Built once, read-only during requests</td></tr>
+            <tr><td>Request id, trace id</td><td>A ContextVar</td><td>One request</td><td>Attached to every log line of that request only</td></tr>
+          </tbody>
+        </table></div>
+        <p>Three kinds of data share one Postgres instance (with the pgvector extension). At this scale that is one backup, one connection string and one thing to monitor. If memory search or checkpoint writes grow large, they are the first to move to their own store.</p>
+        <div class="yours"><b>Building your own</b><p>Write this table for your system before writing code. For each piece of state, ask who reads it, for how long, and what happens if it is lost. Anything per-process (a counter, a cache, a "current model" variable) is a bug waiting for your second worker.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="t_ckpt">Checkpoints</button><button type="button" class="goto" data-goto="t_vec">Memories</button><button type="button" class="goto" data-goto="redis">Redis</button></p>
+      </article>
+
+      <article class="chapter" id="g-loop">
+        <p class="kick">Agent</p>
+        <h3>The agent loop: two nodes and a checkpointer</h3>
+        <p>The graph has two nodes. <code>chat</code> calls the model. If the reply asks for tools, it routes to <code>tool_call</code>, which runs them and routes back to <code>chat</code> with the results; otherwise the graph ends. Each node returns a <code>Command</code> that both updates the state and names the next node, so the routing sits next to the logic that decides it.</p>
+        <p>A hand-written while loop could do the same. LangGraph is used for what comes with the graph: a checkpoint after every step (the history, for free), streaming of model output from inside a node, a recursion limit that stops runaway tool loops, and one span per node in the traces. Because the server holds the history, the client sends only the new turn.</p>
+        <div class="yours"><b>Building your own</b><p>Start with this two-node loop and a persistent checkpointer. When you need retrieval, guardrails, or human approval, add them as nodes rather than growing the chat node: each new node gets its own checkpoint, trace span and tests.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="chatnode">chat node</button><button type="button" class="goto" data-goto="toolnode">tool_call node</button><button type="button" class="goto" data-goto="saver">Checkpointer</button></p>
+      </article>
+
+      <article class="chapter" id="g-memory">
+        <p class="kick">Context</p>
+        <h3>Short-term and long-term memory</h3>
+        <p><b>Short-term memory</b> is the thread itself. Before each model call it is trimmed to the most recent messages that fit in <code>MAX_CONTEXT_TOKENS</code>, starting on a user message so the model never sees a reply without its question. That budget is separate from <code>MAX_TOKENS</code>, which caps the reply, because the two answer different questions: how much the model reads, and how much it may write.</p>
+        <p><b>Long-term memory</b> is a set of facts about the user. After each turn, mem0 sends that turn to a small model that extracts facts, embeds them and stores them per user. Before each run, the latest message is used as a search query and the matching facts are written into the system prompt.</p>
+        <p>The two sides sit differently on the request path. Recall is one vector search, so it runs before the graph and the user waits for it. Writing calls a model, so it runs in a background task after the reply is sent, with only the new turn, so its cost doesn't grow with the conversation. A failed recall returns no facts rather than failing the chat.</p>
+        <p class="trade">Memories belong to the user, not the session: deleting a conversation leaves them in place. That is useful for personalization and a decision you need to make consciously for privacy and data-deletion requests.</p>
+        <div class="yours"><b>Building your own</b><p>Keep anything that calls a model off the request path unless the user is waiting for its result. Decide your memory retention and deletion rules before you store the first fact.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="prep">Trimming</button><button type="button" class="goto" data-goto="memsearch">Recall</button><button type="button" class="goto" data-goto="memupd">Memory update</button></p>
+      </article>
+
+      <article class="chapter" id="g-models">
+        <p class="kick">Resilience</p>
+        <h3>Calling models: retry, fall back, or fail</h3>
+        <p>Model APIs fail in different ways, and each kind needs a different answer. The LLM service sorts errors before reacting to them:</p>
+        <div class="tbl"><table>
+          <thead><tr><th>Error</th><th>Response</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>429, timeout, connection, 5xx</td><td>Retry with backoff (3 tries, 2–10 s), then the next model</td><td>The request was fine; the service was busy</td></tr>
+            <tr><td>404, 403</td><td>Next model right away</td><td>This model isn't available to this key</td></tr>
+            <tr><td>400, 401, 422</td><td>Raise to the caller</td><td>The same request fails on every model</td></tr>
+          </tbody>
+        </table></div>
+        <p>Every call starts at the default model and walks the registry once, with a local index. Nothing about one request's failure changes which model the next request uses, and every model in the registry carries the same tools, so a fallback model can still search the web. Latency is recorded per model that answered, and every fallback increments a counter, so a provider slowly degrading shows up on the dashboard before users notice.</p>
+        <div class="yours"><b>Building your own</b><p>Classify errors before you add retries: retrying a bad request on five models multiplies cost and delay for nothing. Keep fallback state per call. If you need several providers, budgets or caching, a model gateway can take over this layer; the interface stays the same.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="errclass">Error policy</button><button type="button" class="goto" data-goto="bound">Tools on every model</button><button type="button" class="goto" data-goto="reg">Model registry</button></p>
+      </article>
+
+      <article class="chapter" id="g-stream">
+        <p class="kick">Delivery</p>
+        <h3>Streaming with server-sent events</h3>
+        <p>The streaming endpoint is a POST that answers with <code>text/event-stream</code>. Server-sent events are one-way and plain HTTP, so they pass through load balancers and proxies that WebSockets sometimes don't, and the client reads them with a few lines of code.</p>
+        <p>LangGraph's <code>messages</code> stream mode emits model output as it is generated, even though the chat node calls the model with a normal <code>ainvoke</code>. It emits everything, including tool results, so the endpoint forwards only text from the <code>chat</code> node and drops reasoning blocks. Once the first byte is sent the HTTP status can no longer change, so a failure mid-stream ends with a frame that carries an <code>error</code> field. The response also tells proxies not to buffer it.</p>
+        <div class="yours"><b>Building your own</b><p>Decide what the user is allowed to see before you stream: tool output and model reasoning are easy to leak by accident. Define how errors look inside the stream, and measure the stream's whole duration, not the time to the first byte.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="out_tok">Stream filter</button><button type="button" class="goto" data-goto="resp">SSE frames</button></p>
+      </article>
+
+      <article class="chapter" id="g-protect">
+        <p class="kick">Safety</p>
+        <h3>Protecting the API</h3>
+        <p>A request meets the cheap checks first. The middleware chain adds CORS, a request id and default rate limits; then FastAPI runs the auth dependency, which checks the token's signature before it touches the database; then the body is validated; then the route's own rate limit is counted; only then does the handler run.</p>
+        <ul>
+          <li><b>Rate limits</b> are counted per client IP in Redis, with tighter limits on expensive or abusable routes (chat, register, login). Behind a reverse proxy, <code>FORWARDED_ALLOW_IPS</code> tells uvicorn to trust the proxy's <code>X-Forwarded-For</code>; without it every user shares the proxy's address.</li>
+          <li><b>Input</b> is validated by type: clients may send only <code>user</code> and <code>assistant</code> messages of up to 3000 characters. The system prompt is built on the server, which removes one easy route for prompt injection.</li>
+          <li><b>Errors</b> return a stable message and the response's <code>X-Request-ID</code>; the cause goes to the logs under that id, never to the client.</li>
+          <li><b>Secrets</b> are required: the app refuses to start without a JWT secret (or, outside development, with one shorter than 32 characters), and compose refuses to start without the JWT secret and Grafana's admin password. Data stores listen on localhost only.</li>
+        </ul>
+        <div class="yours"><b>Building your own</b><p>Order checks from cheapest to most expensive, and rate-limit before any model call. For authenticated routes, consider limiting per user instead of per IP. Make missing secrets a startup error, never a default.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="limiter">Rate limit</button><button type="button" class="goto" data-goto="validate">Validation</button><button type="button" class="goto" data-goto="errors">Error responses</button></p>
+      </article>
+
+      <article class="chapter" id="g-observe">
+        <p class="kick">Observability</p>
+        <h3>Seeing what happens: four signals</h3>
+        <div class="tbl"><table>
+          <thead><tr><th>Signal</th><th>Tool</th><th>Answers</th></tr></thead>
+          <tbody>
+            <tr><td>Metrics</td><td>Prometheus, Grafana</td><td>How many, how fast, how often a model falls back</td></tr>
+            <tr><td>Traces</td><td>OpenTelemetry, Tempo</td><td>Where one request spent its time: SQL, Redis, the OpenAI call</td></tr>
+            <tr><td>Logs</td><td>structlog JSON, Loki</td><td>What happened, with the request id and trace id on every line</td></tr>
+            <tr><td>LLM traces</td><td>Langfuse</td><td>Prompts, completions, tokens, cost, and evaluation scores</td></tr>
+          </tbody>
+        </table></div>
+        <p>The app speaks one protocol (OTLP) to one place, the OpenTelemetry Collector, which forwards traces to Tempo and ships the log files to Loki. Backends can change without touching the app. Langfuse shares the app's tracing setup but receives only LLM spans, so its views stay about prompts and answers while Tempo sees the whole request.</p>
+        <p>The ids tie it together. A user reports a problem with the <code>X-Request-ID</code> from a response; that finds the log lines, the log lines carry the <code>trace_id</code>, and Grafana opens the trace from there.</p>
+        <div class="yours"><b>Building your own</b><p>Add request ids and structured JSON logs on day one; they cost nothing and every later tool builds on them. Add tracing when requests start crossing more than two services, and LLM tracing as soon as prompts change more than once a week.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="collector">Collector</button><button type="button" class="goto" data-goto="lcm">Request context</button><button type="button" class="goto" data-goto="grafana">Grafana</button><button type="button" class="goto" data-goto="lfclient">Langfuse client</button></p>
+      </article>
+
+      <article class="chapter" id="g-ops">
+        <p class="kick">Operations</p>
+        <h3>Running it: processes, schema, health</h3>
+        <ul>
+          <li><b>Async all the way down.</b> The database driver, Redis client and OpenAI client are all async, so one worker can hold many conversations while each waits seconds on a model.</li>
+          <li><b>Several workers per container.</b> <code>WEB_CONCURRENCY</code> sets the count. Anything kept per process must be merged or moved: metrics are merged across workers through <code>PROMETHEUS_MULTIPROC_DIR</code>, and limits live in Redis.</li>
+          <li><b>Schema as code.</b> Alembic migrations are versioned in git and applied when the container starts; the app never creates tables itself.</li>
+          <li><b>Two health probes.</b> <code>/health/live</code> says the process answers; <code>/health/ready</code> checks Postgres (required, 503 when down) and Redis (optional, reported as degraded). Orchestrators restart on the first and route traffic on the second.</li>
+          <li><b>Reproducible images.</b> The Dockerfile installs exactly what <code>uv.lock</code> pins, in a build stage, and runs as a non-root user without compilers.</li>
+          <li><b>Configuration by environment.</b> One settings object reads environment variables, with per-environment defaults for development, staging, production and test.</li>
+        </ul>
+        <div class="yours"><b>Building your own</b><p>Run two workers locally as early as possible: it is the cheapest way to find state that should have been shared. Separate liveness from readiness before your first deployment, not after the first outage.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="metmod">Metrics across workers</button><button type="button" class="goto" data-goto="t_app">Migrated tables</button></p>
+      </article>
+
+      <article class="chapter" id="g-evals">
+        <p class="kick">Quality</p>
+        <h3>Evaluation: grading production traces offline</h3>
+        <p>Quality is measured outside the request path. <code>make eval</code> pages through the last day of unscored traces in Langfuse, asks a judge model to score each one against five rubric prompts (structured output: a score from 0 to 1 and a one-sentence reason), and writes the scores back to the traces, where they can be charted over time. Running offline adds no latency or cost to users and lets you re-grade old traces with a new rubric.</p>
+        <p class="trade">Rubrics point different ways: for hallucination and toxicity a high score is bad. The report marks each metric's direction so averages aren't misread.</p>
+        <div class="yours"><b>Building your own</b><p>Grade real traffic, and also keep a fixed set of test conversations to run before each prompt or model change. Judge models drift too: re-check a sample of their scores by hand.</p></div>
+        <p class="see">See it: <button type="button" class="goto" data-goto="judge">Judge call</button><button type="button" class="goto" data-goto="metrics">Rubrics</button></p>
+      </article>
+
+      <article class="chapter" id="g-build">
+        <p class="kick">Your turn</p>
+        <h3>Build your own, in this order</h3>
+        <p>Each step is usable on its own and gives the next one something to stand on.</p>
+        <ol class="steps">
+          <li><b>Settings and structured logs</b> with a request id per request. Verify: every log line of a request shares one id.</li>
+          <li><b>Data layer with migrations:</b> users and sessions. Verify: a fresh database comes up from <code>alembic upgrade head</code>.</li>
+          <li><b>Authentication</b> with user and session tokens. Verify: a user token can't reach chat routes.</li>
+          <li><b>The agent loop</b> with a persistent checkpointer and a blocking endpoint. Verify: a second message sees the first.</li>
+          <li><b>The model layer</b> with an error policy. Verify: a simulated 429 falls back, a 400 does not.</li>
+          <li><b>Streaming.</b> Verify: tool output never appears in the stream.</li>
+          <li><b>Shared rate limits</b> in Redis. Verify: two workers enforce one limit.</li>
+          <li><b>Long-term memory.</b> Verify: a fact from one session is recalled in another.</li>
+          <li><b>Metrics, traces and LLM traces.</b> Verify: one request id leads to its logs and its trace.</li>
+          <li><b>Offline evaluation.</b> Verify: scores appear on yesterday's traces.</li>
+          <li><b>Containers, health probes and CI.</b> Verify: the stack starts from a clean checkout with only secrets provided.</li>
+        </ol>
+        <p>The source for each step is linked from the matching blocks above, and the test suite in <code>tests/</code> shows how each behavior is checked without running the infrastructure.</p>
+      </article>
+    </div>
+  </section>
+</main>
+<script>
+  // "See it" buttons: select the block in the explorer and bring the figure into view.
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest && ev.target.closest("button.goto[data-goto]");
+    if (!b || !window.__arch || !window.__arch.arch) return;
+    window.__arch.arch.select(b.getAttribute("data-goto"));
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    document.getElementById("arch").scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "start" });
+  });
+</script>
+<script>
+(function () {
+  "use strict";
+  /* ================= Architecture explorer engine =================
+     Clickable, zoomable architecture diagram drawn as inline SVG from one spec object.
+     Spec: { modes, roots, kinds, data, views, info, traces, repo }. See SKILL.md, "Architecture explorer". */
+  function ArchExplorer(root, A) {
+    var NS = "http://www.w3.org/2000/svg";
+    var CH = 0.61;                                  // mono glyph width / font size, for chip sizing
+    var mode = A.modes[0].key, viewId = null, sel = null, traceI = 0, traceOn = false, shapes = true;
+    var IDX = {}, ORDER = [];
+    var IOH = A.ioHead || ["tensor", "shape", "dtype"], FIND = A.findLabel || "Find a block, tensor or file";
+    var narrow = window.matchMedia ? window.matchMedia("(max-width: 1080px)") : { matches: false };
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+    var MK = A.modes.map(function (m) { return m.key; }).concat(["all"]);
+    function pm(v) {                                // pick a mode-specific value: {train: .., infer: .., all: ..}
+      if (v && typeof v === "object" && !Array.isArray(v) && MK.some(function (k) { return k in v; }))
+        return mode in v ? v[mode] : ("all" in v ? v.all : null);
+      return v;
+    }
+    function vis(o) { return !o.modes || o.modes.indexOf(mode) >= 0; }
+    function info(o) { return (A.info && A.info[o.info || o.id]) || {}; }
+    function el(tag, attrs, parent) {
+      var e = document.createElementNS(NS, tag);
+      for (var k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+      if (parent) parent.appendChild(e);
+      return e;
+    }
+    function lines(s) { return String(pm(s) || "").split("\n"); }
+    function plain(s) { return String(pm(s) || "").replace(/\n/g, " "); }
+
+    // ---- index every node and edge (ids are unique across views) ----
+    Object.keys(A.views).forEach(function (vk) {
+      var v = A.views[vk]; v.id = vk;
+      (v.nodes || []).forEach(function (n) { IDX[n.id] = { type: "node", view: vk, o: n }; ORDER.push(n.id); });
+      (v.edges || []).forEach(function (e) { IDX[e.id] = { type: "edge", view: vk, o: e }; ORDER.push(e.id); });
+    });
+    function titleOf(id) {
+      var it = IDX[id]; if (!it) return id;
+      var o = it.o, inf = info(o);
+      if (inf.t) return plain(inf.t);
+      if (it.type === "node") return plain(o.t);
+      return plain(IDX[o.from] ? titleOf(o.from) : o.from) + " → " + plain(IDX[o.to] ? titleOf(o.to) : o.to);
+    }
+    function viewVisible(vk) { var v = A.views[vk]; return !v.modes || v.modes.indexOf(mode) >= 0; }
+
+    // ---- colours come from the spec: kinds = block styles, data = arrow colours ----
+    var css = "";
+    Object.keys(A.kinds).forEach(function (k) {
+      var c = A.kinds[k];
+      css += ".ax .n-" + k + " > .bx{fill:" + c.fill + ";stroke:" + c.stroke + (c.dash ? ";stroke-dasharray:" + c.dash : "") + "}" +
+        ".ax .ax-sw.n-" + k + "{background:" + c.fill + ";border:1.5px " + (c.dash ? "dashed " : "solid ") + c.stroke + "}" +
+        ".ax .ax-kind.n-" + k + "{color:" + (c.text || c.stroke) + "}";
+    });
+    Object.keys(A.data).forEach(function (k) {
+      var c = A.data[k];
+      css += ".ax .d-" + k + "{color:" + c.color + "}" + (c.dash ? ".ax .ed.d-" + k + " .ln{stroke-dasharray:" + c.dash + "}" : "");
+    });
+    var st = document.createElement("style"); st.textContent = css; document.head.appendChild(st);
+
+    // ---- skeleton ----
+    root.classList.add("ax");
+    root.innerHTML =
+      '<div class="ax-top">' +
+        '<div class="seg" role="group" aria-label="Mode">' + A.modes.map(function (m) { return '<button type="button" data-ax-mode="' + m.key + '" aria-pressed="false">' + esc(m.label) + "</button>"; }).join("") + "</div>" +
+        '<nav class="ax-crumbs" aria-label="Zoom level"></nav>' +
+        '<div class="ax-tools">' +
+          '<label class="ax-tog"><input type="checkbox" checked> Shapes on arrows</label>' +
+          '<div class="ax-find"><input type="search" placeholder="' + esc(FIND) + '" aria-label="' + esc(FIND) + '" autocomplete="off"><div class="ax-hits" role="listbox" hidden></div></div>' +
+        "</div>" +
+      "</div>" +
+      '<div class="ax-main">' +
+        '<div class="ax-left">' +
+          '<div class="ax-stage"><svg class="ax-svg" role="group"></svg></div>' +
+          '<div class="ax-trace">' +
+            '<div class="ax-tbar">' +
+              '<span class="ax-tlabel">Walk through</span>' +
+              '<button type="button" class="btn ax-tprev" aria-label="Previous step"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M8 1 L2.5 5 L8 9 Z"/></svg></button>' +
+              '<button type="button" class="btn primary ax-tnext" aria-label="Next step"><svg viewBox="0 0 10 10" aria-hidden="true"><path d="M2 1 L7.5 5 L2 9 Z"/></svg><span>Start</span></button>' +
+              '<span class="ax-tnum"></span>' +
+              '<ol class="ax-dots" aria-label="Steps"></ol>' +
+            "</div>" +
+            '<div class="ax-tcap" aria-live="polite"></div>' +
+          "</div>" +
+        "</div>" +
+        '<aside class="ax-side"><div class="ax-panel" aria-live="polite" tabindex="-1"></div></aside>' +
+      "</div>" +
+      '<div class="ax-legend"></div>';
+    var svg = root.querySelector(".ax-svg"), panel = root.querySelector(".ax-panel"), crumbs = root.querySelector(".ax-crumbs");
+    var stage = root.querySelector(".ax-stage"), tcap = root.querySelector(".ax-tcap"), tnum = root.querySelector(".ax-tnum");
+    var dots = root.querySelector(".ax-dots"), tnext = root.querySelector(".ax-tnext"), tprev = root.querySelector(".ax-tprev");
+    var find = root.querySelector(".ax-find input"), hits = root.querySelector(".ax-hits");
+
+    root.querySelector(".ax-legend").innerHTML =
+      '<span class="ax-lg-h">Blocks</span>' + Object.keys(A.kinds).map(function (k) { return '<span><i class="ax-sw n-' + k + '"></i>' + esc(A.kinds[k].label) + "</span>"; }).join("") +
+      '<span class="ax-lg-h">Arrows</span>' + Object.keys(A.data).map(function (k) { return '<span><i class="ax-sw ax-swl d-' + k + '"></i>' + esc(A.data[k].label) + "</span>"; }).join("");
+
+    // ---- drawing ----
+    function chip(g, x, y, text, cls) {
+      var w = text.length * 10 * CH + 10, h = 15;
+      var c = el("g", { "class": cls || "ax-lab", transform: "translate(" + (x - w / 2).toFixed(1) + "," + (y - h / 2).toFixed(1) + ")" }, g);
+      el("rect", { width: w.toFixed(1), height: h, rx: 4 }, c);
+      el("text", { x: (w / 2).toFixed(1), y: 10.8, "text-anchor": "middle" }, c).textContent = text;
+      return c;
+    }
+    function textBlock(g, x, y, arr, cls, lh, anchor) {
+      arr.forEach(function (s, i) { el("text", { x: x, y: y + i * lh, "class": cls, "text-anchor": anchor || "middle" }, g).textContent = s; });
+    }
+    function drawNode(n, g) {
+      var k = n.k || "op", t = lines(n.t), s = n.s ? lines(n.s) : [];
+      var a = el("g", { "class": "nd n-" + k + (n.drill ? " drill" : "") + (n.goto ? " port" : ""), "data-id": n.id, tabindex: 0, role: "button",
+        "aria-label": plain(n.t) + (n.s ? ", " + plain(n.s) : "") + (n.drill ? ". Has an inside view." : "") }, g);
+      el("rect", { "class": "bx", x: n.x, y: n.y, width: n.w, height: n.h, rx: k === "port" ? n.h / 2 : (n.r == null ? 8 : n.r) }, a);
+      var top = n.lay === "top", cx = n.x + n.w / 2, tl = 15, sl = 13;
+      var blockH = t.length * tl + (s.length ? 4 + s.length * sl : 0);
+      var y0 = top ? n.y + 19 : n.y + (n.h - blockH) / 2 + 11.5;
+      if (top) textBlock(a, n.x + 12, y0, t, "nt", tl, "start"); else textBlock(a, cx, y0, t, "nt", tl);
+      if (s.length) {
+        var ys = y0 + t.length * tl + 3;
+        if (top) textBlock(a, n.x + 12, ys, s, "ns", sl, "start"); else textBlock(a, cx, ys, s, "ns", sl);
+      }
+      if (k === "frozen") {                         // lock badge on the top border, clear of the title
+        var lx = n.x + n.w - 26, ly = n.y - 7.5;
+        var lk = el("g", { "class": "glyph lock", transform: "translate(" + lx + "," + ly + ")" }, a);
+        el("rect", { "class": "lkbg", x: 0, y: 0, width: 18, height: 15, rx: 4 }, lk);
+        el("rect", { x: 4.5, y: 6.5, width: 9, height: 6, rx: 1.3 }, lk);
+        el("path", { d: "M6.5 6.5 V5 a2.5 2.5 0 0 1 5 0 V6.5", fill: "none" }, lk);
+      }
+      if (k === "lora" || k === "full") chip(a, n.x + n.w - (k === "lora" ? 20 : 26), n.y, k === "lora" ? "LoRA" : "trained", "ax-badge b-" + k);
+      if (n.drill) {
+        var dx = n.x + n.w - 13, dy = n.y + n.h - 13;
+        var d = el("g", { "class": "glyph open", transform: "translate(" + dx + "," + dy + ")" }, a);
+        el("path", { d: "M-5 -1 V-5 H-1 M5 1 V5 H1 M-5 -5 L-1.5 -1.5 M5 5 L1.5 1.5", fill: "none" }, d);
+      }
+      return a;
+    }
+    function edgeGeom(e) {
+      var p = e.pts, d = "M" + p[0][0] + " " + p[0][1];
+      var L = p.length, ax = p[L - 1][0], ay = p[L - 1][1], bx = p[L - 2][0], by = p[L - 2][1];
+      var len = Math.hypot(ax - bx, ay - by) || 1, ux = (ax - bx) / len, uy = (ay - by) / len;
+      for (var i = 1; i < L - 1; i++) d += " L" + p[i][0] + " " + p[i][1];
+      d += " L" + (ax - ux * 6).toFixed(1) + " " + (ay - uy * 6).toFixed(1);
+      var head = [[ax, ay], [ax - ux * 9 - uy * 4.5, ay - uy * 9 + ux * 4.5], [ax - ux * 9 + uy * 4.5, ay - uy * 9 - ux * 4.5]];
+      var best = 0, mx = p[0][0], my = p[0][1];
+      for (var j = 1; j < L; j++) {
+        var sl = Math.hypot(p[j][0] - p[j - 1][0], p[j][1] - p[j - 1][1]);
+        if (sl > best) { best = sl; mx = (p[j][0] + p[j - 1][0]) / 2; my = (p[j][1] + p[j - 1][1]) / 2; }
+      }
+      return { d: d, head: head, lp: e.lp || [mx, my] };
+    }
+    function drawEdge(e, g) {
+      var gm = edgeGeom(e), lab = pm(e.lab), shp = pm(e.sh || e.lab);
+      var a = el("g", { "class": "ed d-" + (e.k || "video") + (e.dash ? " dashed" : ""), "data-id": e.id, tabindex: 0, role: "button",
+        "aria-label": "Connection: " + titleOf(e.id) + (shp ? ", " + shp : "") }, g);
+      el("path", { "class": "hit", d: gm.d }, a);
+      el("path", { "class": "ln", d: gm.d }, a);
+      el("polygon", { "class": "hd", points: gm.head.map(function (q) { return q[0].toFixed(1) + "," + q[1].toFixed(1); }).join(" ") }, a);
+      if (lab) chip(a, gm.lp[0], gm.lp[1], lab);
+      return a;
+    }
+    function render(vk) {
+      viewId = vk;
+      var v = A.views[vk];
+      svg.innerHTML = "";
+      svg.setAttribute("viewBox", "0 0 " + v.w + " " + v.h);
+      svg.setAttribute("aria-label", plain(v.title) + ". Select any block or arrow for details.");
+      svg.style.minWidth = (v.minw || 860) + "px";
+      svg.setAttribute("class", "ax-svg" + (shapes ? "" : " noshapes"));   // no stale focus dimming on new nodes
+      var bg = el("rect", { "class": "ax-bg", x: 0, y: 0, width: v.w, height: v.h }, svg);
+      bg.addEventListener("click", function () { if (traceOn) return; select(null); });
+      (v.groups || []).forEach(function (gr) {
+        if (!vis(gr)) return;
+        var g = el("g", { "class": "grp" + (gr.k ? " g-" + gr.k : "") }, svg);
+        el("rect", { x: gr.x, y: gr.y, width: gr.w, height: gr.h, rx: 12 }, g);
+        var tt = el("text", { x: gr.x + 12, y: gr.y + 18, "class": "gt" }, g);
+        tt.textContent = plain(gr.t);
+        if (gr.s) { var ts = el("tspan", { "class": "gs", dx: 8 }, tt); ts.textContent = plain(gr.s); }
+      });
+      (v.notes || []).forEach(function (nt) {
+        if (!vis(nt)) return;
+        textBlock(svg, nt.x, nt.y, lines(nt.t), "ax-note" + (nt.c ? " " + nt.c : ""), 13, nt.a || "start");
+      });
+      var ge = el("g", { "class": "edges" }, svg), gn = el("g", { "class": "nodes" }, svg);
+      (v.edges || []).forEach(function (e) { if (vis(e)) drawEdge(e, ge); });
+      (v.nodes || []).forEach(function (n) { if (vis(n)) drawNode(n, gn); });
+      // edge labels sit above nodes so a chip is never hidden under a box
+      var gl = el("g", { "class": "labels" }, svg);
+      Array.prototype.slice.call(ge.querySelectorAll(".ax-lab")).forEach(function (c) {
+        var host = c.parentNode, id = host.getAttribute("data-id");
+        c.setAttribute("data-for", id); c.setAttribute("class", "ax-lab d-" + (IDX[id].o.k || "video")); gl.appendChild(c);
+      });
+      renderCrumbs();
+    }
+    function nodesEl() { return Array.prototype.slice.call(svg.querySelectorAll(".nd, .ed")); }
+    function elOf(id) { return svg.querySelector('[data-id="' + id + '"]'); }
+
+    // ---- highlight state ----
+    function paint(focusIds, relIds, cls) {
+      var any = focusIds.length > 0;
+      svg.classList.toggle("focus", any);
+      nodesEl().forEach(function (e) {
+        var id = e.getAttribute("data-id");
+        e.classList.toggle("sel", cls === "sel" && focusIds.indexOf(id) >= 0);
+        e.classList.toggle("on", cls === "on" && focusIds.indexOf(id) >= 0);
+        e.classList.toggle("rel", relIds.indexOf(id) >= 0);
+      });
+      Array.prototype.slice.call(svg.querySelectorAll(".labels .ax-lab")).forEach(function (c) {
+        var id = c.getAttribute("data-for");
+        c.classList.toggle("lit", focusIds.indexOf(id) >= 0 || relIds.indexOf(id) >= 0);
+      });
+    }
+    function neighbours(id) {
+      var it = IDX[id], v = A.views[it.view], rel = [];
+      if (it.type === "edge") { rel.push(it.o.from, it.o.to); return rel; }
+      (v.edges || []).forEach(function (e) { if (vis(e) && (e.from === id || e.to === id)) rel.push(e.id, e.from === id ? e.to : e.from); });
+      return rel;
+    }
+
+    // ---- selection + panel ----
+    function select(id, opts) {
+      opts = opts || {};
+      if (!opts.keepTrace) { traceOn = false; renderTrace(); }
+      sel = id;
+      if (!id) { if (!traceOn) paint([], [], "sel"); showOverview(); setHash(); return; }
+      var it = IDX[id], v = A.views[it.view];
+      var need = !vis(it.o) ? it.o.modes[0] : (v.modes && v.modes.indexOf(mode) < 0 ? v.modes[0] : null);
+      if (need) { setMode(need, true); buildDots(); render(it.view); }
+      else if (it.view !== viewId) render(it.view);
+      if (!traceOn) paint([id], neighbours(id), "sel");
+      else { var cur = elOf(id); nodesEl().forEach(function (e) { e.classList.remove("sel"); }); if (cur) cur.classList.add("sel"); }
+      showPanel(id);
+      setHash();
+      if (narrow.matches) panel.parentNode.scrollTop = 0;   // bottom sheet: show the top of the new detail
+    }
+    function codeList(code) {
+      if (!code || !code.length) return "";
+      return '<h4>Where in the code</h4><ul class="ax-code">' + code.map(function (c) {
+        var path = c[0], ln = c[1] || "", sym = c[2] || "", note = c[3] || "";
+        var spec = path + (ln ? ":" + ln : "");
+        var href = A.repo && A.repo.url ? A.repo.url + "/blob/" + A.repo.commit + "/" + path + (ln ? "#L" + String(ln).replace(/[–-]/, "-L") : "") : null;
+        return "<li>" + (href ? '<a href="' + esc(href) + '" target="_blank" rel="noopener">' + esc(spec) + "</a>" : "<code>" + esc(spec) + "</code>") +
+          '<button type="button" class="ax-copy" data-copy="' + esc(spec) + '" aria-label="Copy ' + esc(spec) + '">copy</button>' +
+          (sym ? '<span class="sym">' + esc(sym) + "</span>" : "") + (note ? '<span class="cn">' + note + "</span>" : "") + "</li>";
+      }).join("") + "</ul>";
+    }
+    function ioTable(rows, edge) {
+      rows = (rows || []).filter(function (r) { return !r[4] || r[4] === mode; });
+      if (!rows.length) return "";
+      return '<h4>' + (edge ? "What travels" : "Inputs and outputs") + '</h4><div class="ax-tbl"><table><thead><tr><th></th><th>' + esc(IOH[0]) + '</th><th>' + esc(IOH[1]) + '</th><th>' + esc(IOH[2]) + '</th></tr></thead><tbody>' +
+        rows.map(function (r) { return '<tr><td class="dir io-' + esc(r[0]) + '">' + esc(r[0]) + "</td><td>" + r[1] + "</td><td><code>" + esc(pm(r[2])) + "</code></td><td>" + esc(pm(r[3]) || "") + "</td></tr>"; }).join("") +
+        "</tbody></table></div>";
+    }
+    function linkBtn(id, text, cls) { return '<button type="button" class="ax-link ' + (cls || "") + '" data-go="' + esc(id) + '">' + text + "</button>"; }
+    function showPanel(id) {
+      var it = IDX[id], o = it.o, inf = info(o), h = [];
+      var kindLabel = it.type === "node" ? (A.kinds[o.k || "op"] || {}).label : "Connection · " + ((A.data[o.k || "video"] || {}).label || "");
+      h.push('<p class="ax-kind ' + (it.type === "node" ? "n-" + (o.k || "op") : "d-" + (o.k || "video")) + '">' + esc(kindLabel) + "</p>");
+      h.push("<h3>" + esc(titleOf(id)) + "</h3>");
+      var tags = (pm(inf.tags) || []).slice();
+      if (it.type === "edge" && pm(o.sh || o.lab)) tags.unshift(pm(o.sh || o.lab));
+      if (tags.length) h.push('<ul class="ax-tags">' + tags.map(function (t) { return "<li>" + esc(t) + "</li>"; }).join("") + "</ul>");
+      if (it.type === "edge") {
+        h.push('<p class="ax-ends">' + linkBtn(o.from, "from " + esc(titleOf(o.from))) + '<span aria-hidden="true">→</span>' + linkBtn(o.to, "to " + esc(titleOf(o.to))) + "</p>");
+      }
+      if (pm(inf.what)) h.push("<p>" + pm(inf.what) + "</p>");
+      else if (it.type === "edge") h.push('<p class="ax-hint">The value handed from one block to the next. Open either end for the code that produces and consumes it.</p>');
+      if (pm(inf.fig)) h.push('<div class="ax-fig">' + pm(inf.fig) + "</div>");
+      h.push(ioTable(inf.io, it.type === "edge"));
+      if (pm(inf.why)) h.push('<h4>Why it is there</h4><p>' + pm(inf.why) + "</p>");
+      A.modes.forEach(function (m) {
+        if (inf[m.key]) h.push('<div class="ax-mode' + (m.key === mode ? " cur" : "") + '"><b>' + esc(m.label) + "</b> " + inf[m.key] + "</div>");
+      });
+      if (inf.params) h.push('<h4>Parameters</h4><p class="ax-params">' + pm(inf.params) + "</p>");
+      h.push(codeList(pm(inf.code)));
+      if (pm(inf.note)) h.push('<p class="ax-warn">' + pm(inf.note) + "</p>");
+      var acts = [];
+      if (o.drill) acts.push(linkBtn(o.drill, "Open inside: " + esc(plain(A.views[o.drill].title)) + " ⤢", "primary").replace("data-go", "data-open"));
+      var gt = pm(o.goto); if (gt && IDX[gt]) acts.push(linkBtn(gt, "Go to " + esc(titleOf(gt)) + " in " + esc(plain(A.views[IDX[gt].view].title))));
+      if (acts.length) h.push('<div class="ax-acts">' + acts.join("") + "</div>");
+      if (it.type === "node") {
+        var v = A.views[it.view], ins = [], outs = [];
+        (v.edges || []).forEach(function (e) {
+          if (!vis(e)) return;
+          var lb = pm(e.lab);
+          if (e.to === id) ins.push(linkBtn(e.id, "← " + (lb ? esc(lb) + " <span>from " + esc(titleOf(e.from)) + "</span>" : "from " + esc(titleOf(e.from)))));
+          if (e.from === id) outs.push(linkBtn(e.id, "→ " + (lb ? esc(lb) + " <span>to " + esc(titleOf(e.to)) + "</span>" : "to " + esc(titleOf(e.to)))));
+        });
+        if (ins.length || outs.length) h.push('<h4>Connections</h4><div class="ax-conns">' + ins.concat(outs).join("") + "</div>");
+      }
+      (pm(inf.see) || []).length && h.push('<h4>See also</h4><div class="ax-conns">' + pm(inf.see).filter(function (s) { return IDX[s]; }).map(function (s) { return linkBtn(s, esc(titleOf(s)) + ' <span>' + esc(plain(A.views[IDX[s].view].title)) + "</span>"); }).join("") + "</div>");
+      panel.innerHTML = h.join("");
+    }
+    function showOverview() {
+      var v = A.views[viewId], h = [];
+      h.push('<p class="ax-kind">' + esc(plain(v.kicker || "Overview")) + "</p><h3>" + esc(plain(v.title)) + "</h3>");
+      if (pm(v.intro)) h.push("<p>" + pm(v.intro) + "</p>");
+      if (pm(v.facts)) h.push('<ul class="ax-tags">' + pm(v.facts).map(function (t) { return "<li>" + esc(t) + "</li>"; }).join("") + "</ul>");
+      var items = (v.nodes || []).filter(function (n) { return vis(n) && n.k !== "port"; });
+      h.push('<h4>Blocks in this view</h4><div class="ax-conns">' + items.map(function (n) { return linkBtn(n.id, esc(plain(n.t)) + (n.drill ? " ⤢" : "")); }).join("") + "</div>");
+      h.push('<p class="ax-hint">Click a block or an arrow to see what it does, the values it passes and where it lives in the code. Blocks marked ⤢ open an inside view. <kbd>Esc</kbd> goes back up.</p>');
+      panel.innerHTML = h.join("");
+    }
+    panel.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button");
+      if (!b) return;
+      if (b.hasAttribute("data-open")) { open(b.getAttribute("data-open")); return; }
+      if (b.hasAttribute("data-go")) { select(b.getAttribute("data-go"), { scroll: false }); var t = elOf(b.getAttribute("data-go")); if (t && t.focus) t.focus({ preventScroll: true }); return; }
+      if (b.hasAttribute("data-copy")) {
+        var txt = b.getAttribute("data-copy");
+        var done = function () { b.textContent = "copied"; setTimeout(function () { b.textContent = "copy"; }, 1200); };
+        try { navigator.clipboard.writeText(txt).then(done, function () { selectText(b.previousElementSibling); }); } catch (e) { selectText(b.previousElementSibling); }
+      }
+    });
+    function selectText(node) { if (!node) return; var r = document.createRange(); r.selectNodeContents(node); var s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+
+    // ---- navigation ----
+    function chain(vk) {
+      var out = [], cur = vk, guard = 0;
+      while (cur && guard++ < 10) { out.unshift(cur); cur = pm(A.views[cur].parent); }
+      return out;
+    }
+    function renderCrumbs() {
+      crumbs.innerHTML = chain(viewId).map(function (vk, i, arr) {
+        var last = i === arr.length - 1;
+        return (i ? '<span class="sep" aria-hidden="true">›</span>' : "") + '<button type="button" data-view="' + vk + '"' + (last ? ' aria-current="page"' : "") + ">" + esc(plain(A.views[vk].crumb || A.views[vk].title)) + "</button>";
+      }).join("");
+    }
+    crumbs.addEventListener("click", function (ev) { var b = ev.target.closest("button[data-view]"); if (b) open(b.getAttribute("data-view")); });
+    function open(vk, selId) {
+      traceOn = false; renderTrace();
+      render(vk);
+      select(selId || null, { scroll: false });
+    }
+    function up() { var c = chain(viewId); if (c.length > 1) open(c[c.length - 2], viewId === c[c.length - 1] ? findDrillParent(c[c.length - 2], viewId) : null); }
+    function findDrillParent(parentView, childView) {
+      var n = (A.views[parentView].nodes || []).filter(function (x) { return x.drill === childView && vis(x); })[0];
+      return n ? n.id : null;
+    }
+
+    svg.addEventListener("click", function (ev) {
+      var g = ev.target.closest(".nd, .ed, .ax-lab");
+      if (!g) return;
+      var id = g.getAttribute("data-id") || g.getAttribute("data-for");
+      select(id);
+    });
+    svg.addEventListener("dblclick", function (ev) {
+      var g = ev.target.closest(".nd"); if (!g) return;
+      var n = IDX[g.getAttribute("data-id")].o;
+      if (n.drill) open(n.drill);
+      else if (pm(n.goto) && IDX[pm(n.goto)]) select(pm(n.goto));
+    });
+    svg.addEventListener("keydown", function (ev) {
+      var g = ev.target.closest && ev.target.closest(".nd, .ed");
+      if (!g) return;
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        var id = g.getAttribute("data-id"), n = IDX[id].o;
+        if (ev.shiftKey && n.drill) open(n.drill); else select(id, { scroll: false });
+      }
+    });
+    root.addEventListener("keydown", function (ev) {
+      var tag = (ev.target.tagName || "").toLowerCase();
+      if (tag === "input") { if (ev.key === "Escape") { hits.hidden = true; find.blur(); } return; }
+      if (ev.key === "Escape") { if (sel || traceOn) { traceOn = false; renderTrace(); select(null); } else up(); }
+      else if (ev.key === "ArrowRight" && !ev.target.closest(".seg")) { ev.preventDefault(); step(1); }
+      else if (ev.key === "ArrowLeft" && !ev.target.closest(".seg")) { ev.preventDefault(); step(-1); }
+    });
+
+    // ---- modes ----
+    var modeBtns = Array.prototype.slice.call(root.querySelectorAll("[data-ax-mode]"));
+    function setMode(m, silent) {
+      mode = m;
+      modeBtns.forEach(function (b) { b.setAttribute("aria-pressed", String(b.getAttribute("data-ax-mode") === m)); });
+      root.setAttribute("data-mode", m);
+      if (silent) return;
+      traceI = 0; traceOn = false;
+      var target = viewId && !A.views[viewId].modes ? viewId : A.roots[m];   // shared inner views stay put
+      buildDots();
+      open(target, sel && IDX[sel] && IDX[sel].view === target && vis(IDX[sel].o) ? sel : null);
+    }
+    modeBtns.forEach(function (b) { b.addEventListener("click", function () { setMode(b.getAttribute("data-ax-mode")); }); });
+
+    // ---- shapes toggle ----
+    root.querySelector(".ax-tog input").addEventListener("change", function (ev) { shapes = ev.target.checked; svg.classList.toggle("noshapes", !shapes); });
+
+    // ---- walk-through ----
+    function steps() { return (A.traces && A.traces[mode]) || []; }
+    function buildDots() {
+      dots.innerHTML = steps().map(function (s, i) { return '<li><button type="button" data-step="' + i + '" aria-label="Step ' + (i + 1) + ": " + esc(s.t) + '"></button></li>'; }).join("");
+      renderTrace();
+    }
+    dots.addEventListener("click", function (ev) { var b = ev.target.closest("button[data-step]"); if (b) applyStep(+b.getAttribute("data-step")); });
+    function renderTrace() {
+      var S = steps(), n = S.length;
+      root.querySelector(".ax-trace").hidden = !n;
+      if (!n) return;
+      tnum.textContent = traceOn ? "Step " + (traceI + 1) + " / " + n : n + " steps";
+      tnext.querySelector("span").textContent = traceOn ? (traceI === n - 1 ? "Restart" : "Next") : (traceI > 0 ? "Resume" : "Start");
+      tprev.disabled = !traceOn || traceI === 0;
+      Array.prototype.slice.call(dots.querySelectorAll("button")).forEach(function (b, i) {
+        b.classList.toggle("done", traceOn && i < traceI);
+        b.setAttribute("aria-current", traceOn && i === traceI ? "step" : "false");
+      });
+      if (traceOn) {
+        var st = S[traceI];
+        tcap.innerHTML = "<b>" + esc(st.t) + "</b> " + (st.cap || "");
+      } else {
+        tcap.innerHTML = '<span class="muted">Step through one ' + esc((A.modes.filter(function (m) { return m.key === mode; })[0] || {}).noun || "pass") + " block by block. Each step lights the blocks and arrows involved and opens the detail for the key one. You control the pace.</span>";
+      }
+    }
+    function applyStep(i) {
+      var S = steps(); if (!S.length) return;
+      traceI = Math.max(0, Math.min(S.length - 1, i)); traceOn = true;
+      var st = S[traceI];
+      if (st.view && st.view !== viewId) render(st.view);
+      var ids = (st.n || []).concat(st.e || []);
+      paint(ids, [], "on");
+      sel = st.sel || null;
+      if (sel) { showPanel(sel); var se = elOf(sel); if (se) se.classList.add("sel"); } else showOverview();
+      renderTrace(); setHash();
+    }
+    function step(d) {
+      var S = steps(); if (!S.length) return;
+      if (!traceOn) { applyStep(d > 0 ? traceI : Math.max(0, traceI - 1)); return; }
+      if (d > 0 && traceI === S.length - 1) { applyStep(0); return; }
+      applyStep(traceI + d);
+    }
+    tnext.addEventListener("click", function () { step(1); });
+    tprev.addEventListener("click", function () { step(-1); });
+
+    // ---- find ----
+    var SEARCH = ORDER.map(function (id) {
+      var it = IDX[id], o = it.o, inf = info(o);
+      var codes = Array.isArray(inf.code) ? inf.code : [].concat.apply([], Object.keys(inf.code || {}).map(function (k) { return inf.code[k]; }));
+      var codeTxt = codes.map(function (c) { return c.join(" "); }).join(" ");
+      var lab = o.lab ? (typeof o.lab === "object" ? Object.keys(o.lab).map(function (k) { return o.lab[k]; }).join(" ") : o.lab) : "";
+      return { id: id, hay: (titleOf(id) + " " + lab + " " + (typeof o.s === "string" ? o.s : "") + " " + codeTxt).toLowerCase() };
+    });
+    find.addEventListener("input", function () {
+      var q = find.value.trim().toLowerCase();
+      if (q.length < 2) { hits.hidden = true; return; }
+      var res = SEARCH.filter(function (s) { return s.hay.indexOf(q) >= 0 && viewVisible(IDX[s.id].view); }).slice(0, 10);
+      hits.innerHTML = res.length ? res.map(function (s) {
+        var it = IDX[s.id];
+        return '<button type="button" role="option" data-go="' + s.id + '"><b>' + esc(titleOf(s.id)) + "</b><span>" + (it.type === "edge" ? "arrow" : "block") + " · " + esc(plain(A.views[it.view].crumb || A.views[it.view].title)) + "</span></button>";
+      }).join("") : '<p class="none">No match</p>';
+      hits.hidden = false;
+    });
+    hits.addEventListener("click", function (ev) {
+      var b = ev.target.closest("button[data-go]"); if (!b) return;
+      hits.hidden = true; find.value = "";
+      select(b.getAttribute("data-go"));
+    });
+    document.addEventListener("click", function (ev) { if (!ev.target.closest(".ax-find")) hits.hidden = true; });
+
+    // ---- deep links: #view or #view.id ----
+    var hashOK = true;
+    function setHash() {
+      if (!hashOK || !A.hash) return;
+      var h = "#" + A.hash + "." + viewId + (sel ? "." + sel : "");
+      try { history.replaceState(null, "", h); } catch (e) { hashOK = false; }
+    }
+    function fromHash() {
+      var h = (location.hash || "").slice(1).split(".");
+      if (!A.hash || h[0] !== A.hash || !A.views[h[1]]) return false;
+      var vk = h[1], id = h[2] && IDX[h[2]] ? h[2] : null;
+      var v = A.views[vk];
+      if (v.modes && v.modes.indexOf(mode) < 0) { setMode(v.modes[0], true); buildDots(); }
+      open(vk, id);
+      return true;
+    }
+
+    // ---- boot ----
+    setMode(mode, true);
+    buildDots();
+    if (!fromHash()) open(A.roots[mode]);
+
+    window.__arch = window.__arch || {};
+    window.__arch[root.id || "arch"] = {
+      modes: A.modes.map(function (m) { return m.key; }),
+      views: Object.keys(A.views),
+      setMode: function (m) { setMode(m); },
+      open: open, select: function (id) { select(id, { scroll: false }); },
+      step: applyStep, steps: function () { return steps().length; },
+      ids: function () { return nodesEl().map(function (e) { return e.getAttribute("data-id"); }); },
+      state: function () { return { mode: mode, view: viewId, sel: sel, trace: traceOn ? traceI : -1, panel: panel.textContent.length }; },
+      info: function (id) { var it = IDX[id]; return it ? info(it.o) : null; },
+      raw: A
+    };
+  }
+
+  /* ================= Spec: production-grade-agentic-system, 2026 revision =================
+     Every block and arrow below was read from the working tree. Code refs written as @sym:Class.method
+     are resolved to line ranges by build.py. Mode "chat" = POST /chat (graph.ainvoke),
+     mode "stream" = POST /chat/stream (graph.astream, stream_mode="messages"). */
+  var SPEC = {
+    hash: "arch",
+    ioHead: ["value", "type / shape", "format"],
+    findLabel: "Find a block, value or file",
+    repo: { url: "https://github.com/HDElectronics/production-grade-agentic-system", commit: "master" },
+    modes: [{ key: "chat", label: "POST /chat", noun: "blocking chat request" }, { key: "stream", label: "POST /chat/stream", noun: "streaming chat request" }],
+    roots: { chat: "system", stream: "system" },
+    kinds: {
+      code:  { label: "this repo's code",      fill: "var(--http-soft)", stroke: "var(--http)", text: "var(--http)" },
+      lib:   { label: "framework or library",  fill: "var(--surface)",   stroke: "var(--ink)" },
+      op:    { label: "helper function",       fill: "var(--surface)",   stroke: "var(--muted)" },
+      store: { label: "stored state",          fill: "var(--msg-soft)",  stroke: "var(--msg)", text: "var(--msg)" },
+      infra: { label: "container in compose",  fill: "var(--surface-2)", stroke: "var(--ink)" },
+      ext:   { label: "hosted API",            fill: "var(--surface-2)", stroke: "var(--muted)", dash: "5 3" },
+      io:    { label: "client",                fill: "var(--bg)",        stroke: "var(--ink)" },
+      port:  { label: "link to another view",  fill: "var(--bg)",        stroke: "var(--muted)", dash: "3 3" }
+    },
+    data: {
+      http: { label: "HTTP request, response", color: "var(--http)" },
+      auth: { label: "credentials, JWT",       color: "var(--auth)" },
+      msg:  { label: "messages, graph state",  color: "var(--msg)" },
+      llm:  { label: "model calls",            color: "var(--llm)" },
+      sql:  { label: "database, Redis I/O",    color: "var(--sql)" },
+      tel:  { label: "logs, metrics, traces",  color: "var(--muted)", dash: "2 4" }
+    },
+    views: {
+      /* ---------- 1. whole system ---------- */
+      system: {
+        title: "System and deployment", crumb: "System", kicker: "Overview · docker-compose",
+        w: 1240, h: 660, minw: 1000,
+        intro: "Containers from <code>docker-compose.yml</code>: the FastAPI app, Postgres with pgvector, Redis, and the telemetry stack (OpenTelemetry Collector, Tempo, Loki, Prometheus, Grafana, cAdvisor). The app calls three hosted APIs. A chat request enters on the left, passes the HTTP stack and reaches the LangGraph agent. Evaluation runs offline against Langfuse traces.",
+        facts: ["Python 3.13", "FastAPI ≥ 0.121", "LangGraph 1.0", "mem0 1.0", "Postgres 16 + pgvector", "Redis 7.4", "OpenTelemetry 1.34", "Langfuse 3.9.1"],
+        groups: [
+          { x: 156, y: 40, w: 744, h: 444, t: "app container", s: "FastAPI on uvicorn · :8000" },
+          { x: 156, y: 500, w: 180, h: 140, t: "redis" },
+          { x: 346, y: 500, w: 554, h: 140, t: "db container", s: "pgvector/pgvector:pg16" },
+          { x: 920, y: 80, w: 280, h: 400, t: "hosted APIs", s: "HTTPS" },
+          { x: 920, y: 500, w: 280, h: 140, t: "offline", s: "make eval" }
+        ],
+        nodes: [
+          { id: "client", x: 20, y: 150, w: 96, h: 120, t: "Client", s: "web app,\ncurl", k: "io" },
+          { id: "telem", x: 20, y: 470, w: 110, h: 160, t: "Telemetry", s: "OTel collector\nTempo · Loki\nPrometheus\nGrafana\ncAdvisor", k: "infra", lay: "top", drill: "obs" },
+          { id: "mw", x: 176, y: 110, w: 150, h: 240, t: "HTTP stack", s: "OTel span\nCORS\nlog context\nMetricsMiddleware\nSlowAPI limits\nroute: auth dep,\nbody, handler", k: "lib", lay: "top", drill: "http" },
+          { id: "chatr", x: 366, y: 130, w: 150, h: 60, t: "Chatbot router", s: "/api/v1/chatbot", k: "code", drill: "http" },
+          { id: "authr", x: 366, y: 250, w: 150, h: 60, t: "Auth router", s: "/api/v1/auth", k: "code", drill: "auth" },
+          { id: "dbsvc", x: 366, y: 380, w: 150, h: 60, t: "DatabaseService", s: "async SQLAlchemy", k: "code" },
+          { id: "agent", x: 556, y: 100, w: 170, h: 160, t: "LangGraphAgent", s: "chat ↔ tool_call loop\nPostgres checkpointer\nmem0 recall + update", k: "code", lay: "top", drill: "agent" },
+          { id: "llmsvc", x: 761, y: 212, w: 120, h: 76, t: "LLMService", s: "retry, then\nnext model", k: "code", drill: "llm" },
+          { id: "mem0", x: 761, y: 340, w: 120, h: 64, t: "mem0", s: "AsyncMemory", k: "lib" },
+          { id: "redis", x: 176, y: 536, w: 140, h: 72, t: "Redis 7.4", s: "rate-limit counters\nrevoked tokens", k: "infra" },
+          { id: "t_app", x: 366, y: 536, w: 150, h: 76, t: "user · session", s: "tables managed\nby Alembic", k: "store" },
+          { id: "t_ckpt", x: 556, y: 536, w: 170, h: 76, t: "LangGraph checkpoints", s: "3 tables keyed\nby thread_id", k: "store" },
+          { id: "t_vec", x: 751, y: 536, w: 140, h: 76, t: "mem0 memories", s: "pgvector\nlongterm_memory", k: "store" },
+          { id: "langfuse", x: 1060, y: 116, w: 126, h: 56, t: "Langfuse", s: "LLM traces, scores", k: "ext" },
+          { id: "openai", x: 1060, y: 210, w: 126, h: 96, t: "OpenAI API", s: "5 chat models\nembeddings\njudge model", k: "ext" },
+          { id: "ddg", x: 940, y: 284, w: 100, h: 48, t: "DuckDuckGo", s: "web search", k: "ext" },
+          { id: "evals", x: 1060, y: 540, w: 126, h: 64, t: "Eval runner", s: "5 LLM judges", k: "code", drill: "evals" }
+        ],
+        edges: [
+          { id: "r_req", from: "client", to: "mw", pts: [[116, 190], [176, 190]], k: "http", lab: "JSON", sh: { chat: "POST /api/v1/chatbot/chat · Bearer session JWT", stream: "POST /api/v1/chatbot/chat/stream · Bearer session JWT" } },
+          { id: "r_res", from: "mw", to: "client", pts: [[176, 240], [116, 240]], k: "http", lab: { chat: "JSON", stream: "SSE" }, sh: { chat: "200 ChatResponse {messages} · X-Request-ID", stream: "200 text/event-stream · data: {content, done, error}" } },
+          { id: "s_mw_chat", from: "mw", to: "chatr", pts: [[326, 160], [366, 160]], k: "http", lab: null, sh: "ChatRequest + Session row" },
+          { id: "s_mw_auth", from: "mw", to: "authr", pts: [[326, 280], [366, 280]], k: "auth", lab: null, sh: "UserCreate · login form · user JWT" },
+          { id: "s_chat_agent", from: "chatr", to: "agent", pts: [[516, 160], [556, 160]], k: "msg", lab: null, sh: { chat: "get_response(messages, session.id, user_id)", stream: "get_stream_response(messages, session.id, user_id)" } },
+          { id: "s_auth_db", from: "authr", to: "dbsvc", pts: [[441, 310], [441, 380]], k: "sql", lab: null, sh: "create_user · get_user_by_email · create_session" },
+          { id: "s_db_app", from: "dbsvc", to: "t_app", pts: [[441, 440], [441, 536]], k: "sql", lab: "async SQL", lp: [441, 466] },
+          { id: "s_mw_redis", from: "mw", to: "redis", pts: [[246, 350], [246, 536]], k: "sql", lab: "rate-limit counters", lp: [246, 440] },
+          { id: "s_auth_redis", from: "authr", to: "redis", pts: [[366, 300], [341, 300], [341, 575], [316, 575]], k: "sql", lab: null, sh: "EXISTS / SET revoked_jti:<jti>" },
+          { id: "s_mw_telem", from: "mw", to: "telem", pts: [[176, 330], [75, 330], [75, 470]], k: "tel", lab: null, sh: "OTLP traces · /metrics · JSON log files" },
+          { id: "s_agent_llm", from: "agent", to: "llmsvc", pts: [[726, 250], [761, 250]], k: "msg", lab: null, sh: "list[BaseMessage]: system + trimmed history" },
+          { id: "s_agent_mem0", from: "agent", to: "mem0", pts: [[680, 260], [680, 372], [761, 372]], k: "msg", lab: null, sh: "search(user_id, last message) · add(new turn)" },
+          { id: "s_agent_ckpt", from: "agent", to: "t_ckpt", pts: [[641, 260], [641, 536]], k: "sql", lab: "checkpoint r/w", lp: [641, 420] },
+          { id: "s_mem0_vec", from: "mem0", to: "t_vec", pts: [[821, 404], [821, 536]], k: "sql", lab: "search · add", lp: [821, 466] },
+          { id: "s_llm_openai", from: "llmsvc", to: "openai", pts: [[881, 250], [1060, 250]], k: "llm", lab: { chat: "messages → AIMessage", stream: "messages → chunks" }, lp: [970, 250] },
+          { id: "s_mem0_openai", from: "mem0", to: "openai", pts: [[881, 372], [1123, 372], [1123, 306]], k: "llm", lab: "embed · extract facts", lp: [990, 372] },
+          { id: "s_agent_ddg", from: "agent", to: "ddg", pts: [[710, 260], [710, 308], [940, 308]], k: "http", lab: "query", lp: [905, 308] },
+          { id: "s_agent_lf", from: "agent", to: "langfuse", pts: [[641, 100], [641, 62], [1123, 62], [1123, 116]], k: "tel", lab: "LLM spans", lp: [880, 62] },
+          { id: "s_evals_lf", from: "evals", to: "langfuse", pts: [[1186, 586], [1228, 586], [1228, 144], [1186, 144]], k: "tel", lab: null, sh: "trace.list (paged) · create_score" },
+          { id: "s_evals_oa", from: "evals", to: "openai", pts: [[1186, 562], [1212, 562], [1212, 258], [1186, 258]], k: "llm", lab: null, sh: "chat.completions.parse → ScoreSchema" }
+        ]
+      },
+
+      /* ---------- 2. one HTTP request ---------- */
+      http: {
+        title: "One chat request through FastAPI", crumb: "HTTP request", parent: "system", kicker: "Inside the HTTP stack",
+        w: 1200, h: 580, minw: 980,
+        intro: "OpenTelemetry's ASGI middleware wraps everything. Then Starlette runs user middleware in reverse order of <code>add_middleware</code>: CORS, the logging context, metrics, and SlowAPI's default limits. Inside the route, FastAPI resolves the auth dependency first, then validates the body, then calls the rate-limited handler.",
+        facts: { chat: ["5 middlewares", "1 auth dependency", "30 / min / IP, shared in Redis"], stream: ["5 middlewares", "1 auth dependency", "20 / min / IP, shared in Redis"] },
+        groups: [
+          { x: 16, y: 40, w: 236, h: 520, t: "middleware", s: "outer → inner" },
+          { x: 272, y: 40, w: 912, h: 520, t: "route", s: { chat: "POST /api/v1/chatbot/chat", stream: "POST /api/v1/chatbot/chat/stream" } }
+        ],
+        nodes: [
+          { id: "p_in", x: 36, y: 64, w: 196, h: 32, t: "from client", k: "port", goto: "client" },
+          { id: "otelmw", x: 36, y: 114, w: 196, h: 48, t: "OpenTelemetry ASGI", s: "request span", k: "lib" },
+          { id: "cors", x: 36, y: 182, w: 196, h: 48, t: "CORSMiddleware", s: "origins from env", k: "lib" },
+          { id: "lcm", x: 36, y: 250, w: 196, h: 48, t: "LoggingContextMiddleware", s: "request_id · trace_id", k: "code" },
+          { id: "mmw", x: 36, y: 318, w: 196, h: 48, t: "MetricsMiddleware", s: "route template · status", k: "code" },
+          { id: "slowmw", x: 36, y: 386, w: 196, h: 48, t: "SlowAPIASGIMiddleware", s: "default limits", k: "lib" },
+          { id: "p_out", x: 36, y: 496, w: 196, h: 34, t: "back to client", k: "port", goto: "client" },
+          { id: "logs", x: 620, y: 84, w: 130, h: 56, t: "structlog", s: "stdout + jsonl", k: "lib" },
+          { id: "p_redisv", x: 292, y: 160, w: 130, h: 34, t: "Redis", k: "port", goto: "redis" },
+          { id: "verify", x: 292, y: 236, w: 130, h: 56, t: "verify_token", s: "HS256 · typ claim\n+ revoked?", k: "op" },
+          { id: "dbget", x: 440, y: 236, w: 150, h: 56, t: "get_session", s: "SELECT by id", k: "code", goto: "t_app" },
+          { id: "bindctx", x: 620, y: 236, w: 130, h: 56, t: "bind_context", s: "ids → logs", k: "op" },
+          { id: "errors", x: 800, y: 230, w: 200, h: 68, t: "Error responses", s: "401 · 404 auth\n422 body · 429 limit", k: "lib" },
+          { id: "bearer", x: 292, y: 394, w: 120, h: 54, t: "HTTPBearer", s: "Authorization", k: "lib" },
+          { id: "sessdep", x: 440, y: 382, w: 150, h: 78, t: "get_current_session", s: "requires typ =\nsession", k: "code" },
+          { id: "validate", x: 620, y: 394, w: 120, h: 54, t: "ChatRequest", s: "user / assistant", k: "lib" },
+          { id: "limiter", x: 770, y: 394, w: 120, h: 54, t: "slowapi", s: { chat: "30 / min / IP", stream: "20 / min / IP" }, k: "lib" },
+          { id: "p_redisl", x: 770, y: 466, w: 120, h: 28, t: "Redis", k: "port", goto: "redis" },
+          { id: "handler", x: 920, y: 382, w: 140, h: 78, t: { chat: "chat()", stream: "chat_stream()" }, s: { chat: "await agent\n.get_response", stream: "StreamingResponse\n(event_generator)" }, k: "code" },
+          { id: "p_agent", x: 1084, y: 404, w: 84, h: 34, t: "agent", k: "port", goto: "p_req" },
+          { id: "resp", x: 920, y: 490, w: 140, h: 54, t: { chat: "ChatResponse", stream: "SSE frames" }, s: { chat: "messages[]", stream: "content, done, error" }, k: "lib" }
+        ],
+        edges: [
+          { id: "h1", from: "p_in", to: "otelmw", pts: [[134, 96], [134, 114]], k: "http" },
+          { id: "h1b", from: "otelmw", to: "cors", pts: [[134, 162], [134, 182]], k: "http" },
+          { id: "h2", from: "cors", to: "lcm", pts: [[134, 230], [134, 250]], k: "http" },
+          { id: "h3", from: "lcm", to: "mmw", pts: [[134, 298], [134, 318]], k: "http" },
+          { id: "h4", from: "mmw", to: "slowmw", pts: [[134, 366], [134, 386]], k: "http" },
+          { id: "h5", from: "slowmw", to: "bearer", pts: [[232, 421], [292, 421]], k: "http", lab: null, sh: "ASGI request" },
+          { id: "h6", from: "bearer", to: "sessdep", pts: [[412, 421], [440, 421]], k: "auth", lab: null, sh: "HTTPAuthorizationCredentials" },
+          { id: "h7", from: "sessdep", to: "verify", pts: [[455, 382], [455, 340], [357, 340], [357, 292]], k: "auth", lab: null, sh: "token, expected typ = session" },
+          { id: "h8", from: "sessdep", to: "dbget", pts: [[515, 382], [515, 292]], k: "sql", lab: null, sh: "session_id (str)" },
+          { id: "h9", from: "sessdep", to: "bindctx", pts: [[575, 382], [575, 340], [685, 340], [685, 292]], k: "tel", lab: null, sh: "session.user_id, session.id" },
+          { id: "h10", from: "sessdep", to: "validate", pts: [[590, 421], [620, 421]], k: "http", lab: null, sh: "Session ok → solve body" },
+          { id: "h11", from: "validate", to: "limiter", pts: [[740, 421], [770, 421]], k: "http", lab: null, sh: "ChatRequest" },
+          { id: "h12", from: "limiter", to: "handler", pts: [[890, 421], [920, 421]], k: "http", lab: null, sh: "under the limit" },
+          { id: "h13", from: "handler", to: "p_agent", pts: [[1060, 421], [1084, 421]], k: "msg", lab: null, sh: "messages, session.id, session.user_id" },
+          { id: "h14", from: "handler", to: "resp", pts: [[990, 460], [990, 490]], k: "http", lab: null, sh: { chat: "list[Message]", stream: "async generator of text chunks" } },
+          { id: "h15", from: "resp", to: "p_out", pts: [[920, 513], [232, 513]], k: "http", lab: { chat: "200 application/json", stream: "200 text/event-stream" }, lp: [576, 513] },
+          { id: "h16", from: "validate", to: "errors", pts: [[730, 394], [730, 360], [850, 360], [850, 298]], k: "http", lab: "422", lp: [790, 360] },
+          { id: "h17", from: "limiter", to: "errors", pts: [[880, 394], [880, 298]], k: "http", lab: "429", lp: [880, 346] },
+          { id: "h18", from: "bindctx", to: "logs", pts: [[685, 236], [685, 140]], k: "tel", lab: null, sh: "user_id, session_id in ContextVar" },
+          { id: "h19", from: "lcm", to: "logs", pts: [[232, 274], [256, 274], [256, 112], [620, 112]], k: "tel", lab: null, sh: "request_id, trace_id in ContextVar" },
+          { id: "h20", from: "verify", to: "p_redisv", pts: [[357, 236], [357, 194]], k: "sql", lab: null, sh: "EXISTS revoked_jti:<jti>" },
+          { id: "h21", from: "limiter", to: "p_redisl", pts: [[830, 448], [830, 466]], k: "sql", lab: null, sh: "INCR the IP's window counter" }
+        ]
+      },
+
+      /* ---------- 3. the agent ---------- */
+      agent: {
+        title: "Inside LangGraphAgent", crumb: "Agent", parent: "system", kicker: { chat: "get_response()", stream: "get_stream_response()" },
+        w: 1180, h: 610, minw: 980,
+        intro: { chat: "<code>get_response</code> recalls memories, runs the compiled graph with <code>ainvoke</code> (in a child task) under the session's thread id, returns the filtered thread, and schedules a memory update with the new turn.", stream: "<code>get_stream_response</code> recalls memories, runs the compiled graph with <code>astream(stream_mode='messages')</code> and yields only the chat node's text, then reads the final state and schedules a memory update with the new turn." },
+        facts: ["2 nodes: chat, tool_call", "thread_id = session id", "checkpoint after every step", "1 tool: DuckDuckGo"],
+        groups: [{ x: 440, y: 40, w: 470, h: 400, t: "compiled graph", s: { chat: "ainvoke()", stream: "astream(messages)" } }],
+        nodes: [
+          { id: "p_req", x: 24, y: 182, w: 170, h: 34, t: "from handler", k: "port", goto: "handler" },
+          { id: "cfg", x: 236, y: 60, w: 170, h: 66, t: "RunnableConfig", s: "thread_id=session_id\nlangfuse_* metadata", k: "op" },
+          { id: "inp", x: 236, y: 166, w: 170, h: 66, t: "graph input", s: "new messages\n+ long_term_memory", k: "op" },
+          { id: "memsearch", x: 24, y: 280, w: 170, h: 66, t: "_get_relevant_memory", s: "mem0.search(user_id,\nlast message)", k: "code" },
+          { id: "p_mem0", x: 24, y: 410, w: 170, h: 34, t: "mem0 search", k: "port", goto: "mem0" },
+          { id: "p_ddg", x: 236, y: 338, w: 170, h: 34, t: "DuckDuckGo", k: "port", goto: "ddg" },
+          { id: "chatnode", x: 520, y: 154, w: 160, h: 90, t: "chat", s: "_chat · LLM call\nsystem prompt + memory", k: "code", drill: "chatnode" },
+          { id: "p_llm", x: 760, y: 110, w: 120, h: 34, t: "LLMService", k: "port", goto: "callfn" },
+          { id: "g_end", x: 760, y: 176, w: 110, h: 46, t: "END", s: "no tool_calls", k: "op" },
+          { id: "toolnode", x: 520, y: 320, w: 160, h: 70, t: "tool_call", s: "_tool_call · run tools", k: "code" },
+          { id: "state", x: 740, y: 316, w: 150, h: 92, t: "GraphState", s: "messages:\n  add_messages\nlong_term_memory", k: "store" },
+          { id: "graphinit", x: 500, y: 470, w: 170, h: 56, t: "create_graph()", s: "once, behind a lock", k: "code" },
+          { id: "saver", x: 720, y: 470, w: 190, h: 56, t: "AsyncPostgresSaver", s: "required · pool max 20", k: "lib" },
+          { id: "p_ckpt", x: 740, y: 556, w: 150, h: 34, t: "checkpoints", k: "port", goto: "t_ckpt" },
+          { id: "out_proc", x: 950, y: 166, w: 200, h: 66, t: "__process_messages", s: "user + assistant text\nno length cap", k: "code", modes: ["chat"] },
+          { id: "out_tok", x: 950, y: 140, w: 200, h: 66, t: "_stream_text", s: "chat node text only\nno tool output", k: "code", modes: ["stream"] },
+          { id: "p_resp", x: 990, y: 262, w: 120, h: 34, t: "to handler", k: "port", goto: "handler" },
+          { id: "memupd", x: 950, y: 340, w: 200, h: 66, t: "_schedule_memory_update", s: "new turn only\ntask kept until done", k: "code" },
+          { id: "p_mem0b", x: 990, y: 450, w: 120, h: 34, t: "mem0 add", k: "port", goto: "mem0" }
+        ],
+        edges: [
+          { id: "ag_req_inp", from: "p_req", to: "inp", pts: [[194, 199], [236, 199]], k: "msg", lab: null, sh: "list[ChatMessage]" },
+          { id: "ag_req_mem", from: "p_req", to: "memsearch", pts: [[109, 216], [109, 280]], k: "msg", lab: null, sh: "user_id, messages[-1].content" },
+          { id: "ag_req_cfg", from: "p_req", to: "cfg", pts: [[150, 182], [150, 93], [236, 93]], k: "auth", lab: null, sh: "session_id, user_id" },
+          { id: "ag_mem_q", from: "memsearch", to: "p_mem0", pts: [[109, 346], [109, 410]], k: "msg", lab: "search", lp: [109, 378] },
+          { id: "ag_mem_inp", from: "memsearch", to: "inp", pts: [[194, 313], [321, 313], [321, 232]], k: "msg", lab: "memory text", lp: [258, 313] },
+          { id: "ag_inp_chat", from: "inp", to: "chatnode", pts: [[406, 199], [520, 199]], k: "msg", lab: "state input", lp: [463, 199] },
+          { id: "ag_cfg_chat", from: "cfg", to: "chatnode", pts: [[406, 93], [600, 93], [600, 154]], k: "auth", lab: "thread_id", lp: [503, 93] },
+          { id: "ag_chat_llm", from: "chatnode", to: "p_llm", pts: [[660, 154], [660, 127], [760, 127]], k: "llm", lab: null, sh: "SystemMessage + trimmed history" },
+          { id: "ag_chat_tool", from: "chatnode", to: "toolnode", pts: [[570, 244], [570, 320]], k: "msg", lab: "tool_calls", lp: [570, 282] },
+          { id: "ag_tool_chat", from: "toolnode", to: "chatnode", pts: [[640, 320], [640, 244]], k: "msg", lab: null, sh: "Command(goto='chat'), one ToolMessage per call" },
+          { id: "ag_chat_end", from: "chatnode", to: "g_end", pts: [[680, 199], [760, 199]], k: "msg", lab: null, sh: "Command(goto=END)" },
+          { id: "ag_chat_state", from: "chatnode", to: "state", pts: [[680, 230], [710, 230], [710, 340], [740, 340]], k: "msg", lab: null, sh: "Command.update: {messages: [AIMessage]}" },
+          { id: "ag_tool_state", from: "toolnode", to: "state", pts: [[680, 370], [740, 370]], k: "msg", lab: null, sh: "Command.update: {messages: [ToolMessage…]}" },
+          { id: "ag_tool_ddg", from: "toolnode", to: "p_ddg", pts: [[520, 355], [406, 355]], k: "http", lab: "query", lp: [463, 355] },
+          { id: "ag_state_saver", from: "state", to: "saver", pts: [[815, 408], [815, 470]], k: "sql", lab: "checkpoint", lp: [815, 444] },
+          { id: "ag_saver_ckpt", from: "saver", to: "p_ckpt", pts: [[815, 526], [815, 556]], k: "sql", lab: null, sh: "one checkpoint per step" },
+          { id: "ag_init_saver", from: "graphinit", to: "saver", pts: [[670, 498], [720, 498]], k: "sql", lab: null, sh: "AsyncConnectionPool + setup()" },
+          { id: "ag_end_out", from: "g_end", to: "out_proc", pts: [[870, 199], [950, 199]], k: "msg", lab: null, sh: "final state['messages'] (whole thread)", modes: ["chat"] },
+          { id: "ag_chat_tok", from: "chatnode", to: "out_tok", pts: [[680, 164], [950, 164]], k: "llm", lab: "AIMessageChunk", lp: [820, 164], modes: ["stream"] },
+          { id: "ag_out_resp", from: "out_proc", to: "p_resp", pts: [[1050, 232], [1050, 262]], k: "msg", lab: null, sh: "list[Message]", modes: ["chat"] },
+          { id: "ag_tok_resp", from: "out_tok", to: "p_resp", pts: [[1050, 206], [1050, 262]], k: "msg", lab: null, sh: "str per chunk", modes: ["stream"] },
+          { id: "ag_end_memupd", from: "g_end", to: "memupd", pts: [[815, 222], [815, 262], [920, 262], [920, 373], [950, 373]], k: "msg", lab: null, sh: { chat: "sent messages + final reply", stream: "sent messages + final reply from aget_state()" } },
+          { id: "ag_memupd_out", from: "memupd", to: "p_mem0b", pts: [[1050, 406], [1050, 450]], k: "msg", dash: true, lab: null, sh: "[user msg(s), assistant reply] + metadata" }
+        ]
+      },
+
+      /* ---------- 4. the chat node ---------- */
+      chatnode: {
+        title: "The chat node", crumb: "chat node", parent: "agent", kicker: "workflow.py · _chat()",
+        w: 1180, h: 420, minw: 960,
+        intro: "One run of the <code>chat</code> node: fill the system prompt, trim the history to the context budget, call the LLM service, clean up the reply and route on whether it asks for tools.",
+        facts: ["MAX_CONTEXT_TOKENS = 8000", "MAX_TOKENS = 2000 per reply", "trim strategy: last"],
+        groups: [{ x: 190, y: 40, w: 830, h: 360, t: "chat node", s: "_chat(state, config)" }],
+        nodes: [
+          { id: "p_state", x: 20, y: 216, w: 150, h: 34, t: "GraphState", k: "port", goto: "state" },
+          { id: "sysprompt", x: 210, y: 70, w: 170, h: 56, t: "load_system_prompt", s: "system.md + memory", k: "op" },
+          { id: "prep", x: 210, y: 200, w: 170, h: 66, t: "prepare_messages", s: "MAX_CONTEXT_TOKENS\nSystemMessage first", k: "op" },
+          { id: "llmcall", x: 430, y: 190, w: 170, h: 86, t: "LLMService.call", s: "retry, next model\nlatency per model", k: "code", drill: "llm" },
+          { id: "proc", x: 650, y: 200, w: 170, h: 66, t: "process_llm_response", s: "keep text blocks\ndrop reasoning", k: "op" },
+          { id: "route", x: 870, y: 196, w: 130, h: 74, t: "tool_calls?", s: "Command(goto=…)", k: "op" },
+          { id: "p_tool", x: 1040, y: 150, w: 120, h: 34, t: "tool_call", k: "port", goto: "toolnode" },
+          { id: "p_end", x: 1040, y: 270, w: 120, h: 34, t: "END", k: "port", goto: "g_end" },
+          { id: "hist", x: 430, y: 330, w: 170, h: 56, t: "llm_inference_duration", s: "by answering model", k: "lib", goto: "metmod" },
+          { id: "p_stream", x: 650, y: 80, w: 170, h: 34, t: "SSE chunks", k: "port", goto: "out_tok", modes: ["stream"] }
+        ],
+        edges: [
+          { id: "c1", from: "p_state", to: "sysprompt", pts: [[95, 216], [95, 98], [210, 98]], k: "msg", lab: null, sh: "state.long_term_memory" },
+          { id: "c2", from: "p_state", to: "prep", pts: [[170, 233], [210, 233]], k: "msg", lab: null, sh: "state.messages" },
+          { id: "c3", from: "sysprompt", to: "prep", pts: [[295, 126], [295, 200]], k: "msg", lab: "system prompt", lp: [295, 163] },
+          { id: "c4", from: "prep", to: "llmcall", pts: [[380, 233], [430, 233]], k: "msg", lab: null, sh: "list[BaseMessage]: system + last ≤ 8000 tokens" },
+          { id: "c5", from: "llmcall", to: "proc", pts: [[600, 233], [650, 233]], k: "llm", lab: null, sh: "AIMessage" },
+          { id: "c6", from: "proc", to: "route", pts: [[820, 233], [870, 233]], k: "msg", lab: null, sh: "AIMessage, content: str" },
+          { id: "c7", from: "route", to: "p_tool", pts: [[935, 196], [935, 167], [1040, 167]], k: "msg", lab: "tool_calls", lp: [988, 167] },
+          { id: "c8", from: "route", to: "p_end", pts: [[935, 270], [935, 287], [1040, 287]], k: "msg", lab: "none", lp: [988, 287] },
+          { id: "c9", from: "llmcall", to: "hist", pts: [[515, 276], [515, 330]], k: "tel", lab: null, sh: "seconds, label model" },
+          { id: "c10", from: "llmcall", to: "p_stream", pts: [[560, 190], [560, 97], [650, 97]], k: "llm", lab: "chunks", lp: [605, 97], modes: ["stream"] }
+        ]
+      },
+
+      /* ---------- 5. LLM service ---------- */
+      llm: {
+        title: "LLMService: retry, then fall back", crumb: "LLMService", parent: "chatnode", kicker: "llm_provider.py",
+        w: 1170, h: 460, minw: 960,
+        intro: "Every call starts at the default model and walks the registry once. Transient errors are retried with backoff, then the next model is tried; requests that would fail on any model are raised at once. Every model carries the tools, and nothing about one call changes the next.",
+        facts: ["3 attempts per model", "wait 2–10 s", "5 models", "llm_fallbacks_total"],
+        groups: [{ x: 180, y: 40, w: 440, h: 410, t: "LLMService", s: "no per-request state" }],
+        nodes: [
+          { id: "p_llmin", x: 20, y: 120, w: 140, h: 34, t: "from chat node", k: "port", goto: "llmcall" },
+          { id: "callfn", x: 200, y: 100, w: 160, h: 74, t: "call()", s: "start at default\none pass over 5", k: "code" },
+          { id: "retry", x: 410, y: 100, w: 190, h: 74, t: "_call_with_retry", s: "transient errors only\n3 attempts · 2–10 s", k: "code" },
+          { id: "p_openai", x: 650, y: 120, w: 140, h: 34, t: "OpenAI API", k: "port", goto: "openai" },
+          { id: "errclass", x: 200, y: 230, w: 160, h: 110, t: "error policy", s: "429, timeout, 5xx:\n  retry, then next\n404, 403: next\n400, 401, 422: raise", k: "op" },
+          { id: "bound", x: 410, y: 240, w: 190, h: 66, t: "bound models", s: "bind_tools on each\ncached per model", k: "store" },
+          { id: "fail", x: 200, y: 380, w: 160, h: 50, t: "RuntimeError", s: "all 5 failed", k: "op" },
+          { id: "reg", x: 850, y: 100, w: 300, h: 190, t: "LLMRegistry.LLMS", s: "0  gpt-5-mini   reasoning low\n1  gpt-5        reasoning medium\n2  gpt-5-nano   reasoning minimal\n3  gpt-4o       temperature 0.2\n4  gpt-4o-mini  temperature 0.2\n\nall: max_tokens = 2000\nnext = (i + 1) % 5", k: "lib", lay: "top" }
+        ],
+        edges: [
+          { id: "l1", from: "p_llmin", to: "callfn", pts: [[160, 137], [200, 137]], k: "msg", lab: null, sh: "list[BaseMessage]" },
+          { id: "l2", from: "callfn", to: "retry", pts: [[360, 137], [410, 137]], k: "msg", lab: null, sh: "model index, messages" },
+          { id: "l3", from: "retry", to: "p_openai", pts: [[600, 137], [650, 137]], k: "llm", lab: null, sh: "model.ainvoke(messages)" },
+          { id: "l4", from: "retry", to: "errclass", pts: [[450, 174], [450, 205], [280, 205], [280, 230]], k: "llm", lab: "OpenAIError", lp: [365, 205] },
+          { id: "l5", from: "errclass", to: "callfn", pts: [[220, 230], [220, 174]], k: "llm", lab: null, sh: "next model (local loop variable)" },
+          { id: "l6", from: "bound", to: "retry", pts: [[505, 240], [505, 174]], k: "llm", lab: null, sh: "the model with tools bound" },
+          { id: "l7", from: "errclass", to: "fail", pts: [[280, 340], [280, 380]], k: "llm", lab: "5 tried", lp: [280, 360] },
+          { id: "l8", from: "reg", to: "bound", pts: [[850, 273], [600, 273]], k: "llm", lab: "bind_tools", lp: [725, 273] },
+          { id: "l9", from: "errclass", to: "p_llmin", pts: [[200, 300], [90, 300], [90, 154]], k: "llm", lab: "raise", lp: [145, 300] }
+        ]
+      },
+
+      /* ---------- 6. auth ---------- */
+      auth: {
+        title: "Sign-up, login, sessions and logout", crumb: "Auth", parent: "system", kicker: "auth.py",
+        w: 1180, h: 510, minw: 960,
+        intro: "Two kinds of token come out of <code>create_access_token</code>, told apart by the <code>typ</code> claim: a <b>user token</b> from register and login, and a <b>session token</b> from <code>POST /auth/session</code>. Each route checks the kind, and <code>POST /auth/logout</code> revokes a token in Redis.",
+        facts: ["HS256", "typ: user | session", "30-day expiry", "bcrypt", "revocation in Redis"],
+        nodes: [
+          { id: "p_cli", x: 20, y: 200, w: 130, h: 34, t: "client", k: "port", goto: "client" },
+          { id: "reg", x: 200, y: 60, w: 180, h: 74, t: "POST /auth/register", s: "UserCreate JSON\n10 / hour / IP", k: "code" },
+          { id: "login", x: 200, y: 180, w: 180, h: 74, t: "POST /auth/login", s: "OAuth2 form\n20 / min / IP", k: "code" },
+          { id: "sess", x: 200, y: 320, w: 180, h: 74, t: "POST /auth/session", s: "user token\n30 / min / IP", k: "code" },
+          { id: "pwcheck", x: 430, y: 30, w: 160, h: 50, t: "password rules", s: "8–64, Aa, 0-9, symbol", k: "op" },
+          { id: "bcrypt", x: 430, y: 124, w: 160, h: 46, t: "bcrypt", s: "hash · checkpw", k: "lib" },
+          { id: "jwt", x: 650, y: 190, w: 170, h: 74, t: "create_access_token", s: "sub, typ, exp, iat,\njti (uuid4)", k: "op" },
+          { id: "getuser", x: 430, y: 400, w: 160, h: 56, t: "get_current_user", s: "typ = user → User", k: "code" },
+          { id: "p_db", x: 650, y: 411, w: 170, h: 34, t: "DatabaseService", k: "port", goto: "dbsvc" },
+          { id: "sessops", x: 880, y: 40, w: 270, h: 84, t: "Other session routes", s: "PATCH /session/{id}/name\nDELETE /session/{id}\nGET /sessions", k: "code", lay: "top" },
+          { id: "logout", x: 880, y: 180, w: 220, h: 64, t: "POST /auth/logout", s: "user or session token\n30 / min / IP", k: "code" },
+          { id: "p_redisa", x: 880, y: 300, w: 220, h: 34, t: "Redis", k: "port", goto: "redis" }
+        ],
+        edges: [
+          { id: "a1", from: "p_cli", to: "reg", pts: [[85, 200], [85, 97], [200, 97]], k: "auth", lab: "UserCreate", lp: [142, 97] },
+          { id: "a2", from: "p_cli", to: "login", pts: [[150, 217], [200, 217]], k: "auth", lab: null, sh: "form: username, password, grant_type" },
+          { id: "a3", from: "p_cli", to: "sess", pts: [[85, 234], [85, 357], [200, 357]], k: "auth", lab: "user JWT", lp: [142, 357] },
+          { id: "a4", from: "reg", to: "pwcheck", pts: [[380, 70], [430, 70]], k: "auth", lab: null, sh: "password as typed" },
+          { id: "a5", from: "reg", to: "bcrypt", pts: [[340, 134], [340, 147], [430, 147]], k: "auth", lab: null, sh: "hash_password(password as typed)" },
+          { id: "a6", from: "login", to: "bcrypt", pts: [[380, 196], [510, 196], [510, 170]], k: "auth", lab: null, sh: "verify_password(password as typed)" },
+          { id: "a7", from: "reg", to: "jwt", pts: [[380, 97], [620, 97], [620, 200], [650, 200]], k: "auth", lab: "typ = user", lp: [520, 97] },
+          { id: "a8", from: "login", to: "jwt", pts: [[380, 227], [650, 227]], k: "auth", lab: "typ = user", lp: [450, 227] },
+          { id: "a9", from: "sess", to: "getuser", pts: [[290, 394], [290, 428], [430, 428]], k: "auth", lab: null, sh: "Bearer user JWT" },
+          { id: "a10", from: "sess", to: "jwt", pts: [[380, 357], [620, 357], [620, 254], [650, 254]], k: "auth", lab: "typ = session", lp: [500, 357] },
+          { id: "a11", from: "getuser", to: "p_db", pts: [[590, 428], [650, 428]], k: "sql", lab: null, sh: "get_user(int(sub))" },
+          { id: "a13", from: "sess", to: "p_db", pts: [[380, 385], [700, 385], [700, 411]], k: "sql", lab: null, sh: "create_session(uuid4, user.id)" },
+          { id: "a12", from: "jwt", to: "p_cli", pts: [[820, 227], [850, 227], [850, 480], [60, 480], [60, 234]], k: "auth", lab: "Token {access_token, expires_at}", lp: [450, 480] },
+          { id: "a14", from: "logout", to: "p_redisa", pts: [[990, 244], [990, 300]], k: "sql", lab: "SET revoked_jti", lp: [990, 272] }
+        ]
+      },
+
+      /* ---------- 7. telemetry ---------- */
+      obs: {
+        title: "Logs, traces and metrics", crumb: "Telemetry", parent: "system", kicker: "OpenTelemetry · Grafana stack",
+        w: 1180, h: 500, minw: 960,
+        intro: "Traces go from the app to the OpenTelemetry Collector and on to Tempo. Log lines are written as JSON files; the collector tails them and ships them to Loki. Prometheus scrapes <code>/metrics</code>. Every log line carries the request's <code>trace_id</code>, and Grafana is provisioned to jump between a log line and its trace. Langfuse receives only the LLM spans.",
+        facts: ["OTLP/HTTP :4318", "Tempo 2.6", "Loki 3.3", "Prometheus 2.55", "Grafana 11.3"],
+        groups: [{ x: 20, y: 40, w: 360, h: 440, t: "app container", s: "every uvicorn worker" }],
+        nodes: [
+          { id: "otelinst", x: 40, y: 170, w: 300, h: 70, t: "OpenTelemetry SDK", s: "FastAPI · SQLAlchemy\nRedis · HTTPX spans", k: "code" },
+          { id: "lfclient", x: 40, y: 80, w: 300, h: 60, t: "Langfuse client", s: "LLM spans, infra scopes blocked", k: "code" },
+          { id: "logsys", x: 40, y: 270, w: 300, h: 70, t: "structlog", s: "logs/<env>-<day>.jsonl\nrequest_id · trace_id", k: "code" },
+          { id: "metmod", x: 40, y: 370, w: 300, h: 70, t: "MetricsMiddleware + /metrics", s: "route templates\nall workers merged", k: "code" },
+          { id: "p_langfuse", x: 460, y: 93, w: 180, h: 34, t: "Langfuse", k: "port", goto: "langfuse" },
+          { id: "collector", x: 460, y: 160, w: 180, h: 120, t: "OTel Collector", s: "OTLP in :4318\nfilelog in\n/var/log/app", k: "infra" },
+          { id: "cadvisor", x: 460, y: 420, w: 180, h: 50, t: "cAdvisor", s: "container CPU, memory", k: "infra" },
+          { id: "tempo", x: 760, y: 80, w: 160, h: 60, t: "Tempo", s: "traces · 72 h local", k: "infra" },
+          { id: "loki", x: 760, y: 220, w: 160, h: 60, t: "Loki", s: "logs · OTLP ingest", k: "infra" },
+          { id: "prometheus", x: 760, y: 370, w: 160, h: 60, t: "Prometheus", s: "scrape every 15 s", k: "infra" },
+          { id: "grafana", x: 1000, y: 210, w: 160, h: 110, t: "Grafana", s: "dashboard\n\"Agentic API\"\nlogs ⇄ traces", k: "infra" }
+        ],
+        edges: [
+          { id: "o1", from: "otelinst", to: "collector", pts: [[340, 205], [460, 205]], k: "tel", lab: "OTLP traces", lp: [400, 205] },
+          { id: "o2", from: "logsys", to: "collector", pts: [[340, 305], [400, 305], [400, 250], [460, 250]], k: "tel", lab: "tail JSONL", lp: [400, 278] },
+          { id: "o3", from: "collector", to: "tempo", pts: [[640, 190], [700, 190], [700, 110], [760, 110]], k: "tel", lab: "OTLP gRPC", lp: [700, 150] },
+          { id: "o4", from: "collector", to: "loki", pts: [[640, 250], [760, 250]], k: "tel", lab: "OTLP /otlp", lp: [700, 250] },
+          { id: "o5", from: "metmod", to: "prometheus", pts: [[340, 400], [760, 400]], k: "tel", lab: "scrape /metrics", lp: [550, 400] },
+          { id: "o6", from: "cadvisor", to: "prometheus", pts: [[640, 445], [700, 445], [700, 420], [760, 420]], k: "tel", lab: null, sh: "container metrics" },
+          { id: "o7", from: "tempo", to: "grafana", pts: [[920, 110], [960, 110], [960, 232], [1000, 232]], k: "tel", lab: null, sh: "TraceQL" },
+          { id: "o8", from: "loki", to: "grafana", pts: [[920, 266], [1000, 266]], k: "tel", lab: null, sh: "LogQL" },
+          { id: "o9", from: "prometheus", to: "grafana", pts: [[920, 400], [980, 400], [980, 300], [1000, 300]], k: "tel", lab: null, sh: "PromQL" },
+          { id: "o10", from: "lfclient", to: "p_langfuse", pts: [[340, 110], [460, 110]], k: "tel", lab: null, sh: "LLM spans over HTTPS" }
+        ]
+      },
+
+      /* ---------- 8. offline evals ---------- */
+      evals: {
+        title: "Offline evaluation", crumb: "Evals", parent: "system", kicker: "evals/",
+        w: 1070, h: 420, minw: 900,
+        intro: "A CLI, not a service. It pages through the last 24 hours of unscored Langfuse traces, asks a judge model for a 0–1 score per rubric (a few calls at a time), writes each score back to the trace, and saves a JSON report.",
+        facts: ["5 rubrics", "≤ 500 traces / run", "judge: EVALUATION_LLM = gpt-5", "4 concurrent judge calls"],
+        nodes: [
+          { id: "cli", x: 20, y: 150, w: 150, h: 66, t: "make eval", s: "evals/main.py\n3 run modes", k: "code" },
+          { id: "p_lf_in", x: 220, y: 40, w: 170, h: 34, t: "Langfuse", k: "port", goto: "langfuse" },
+          { id: "fetch", x: 220, y: 150, w: 170, h: 66, t: "__fetch_traces", s: "24 h · paginated\nunscored only", k: "code" },
+          { id: "io", x: 440, y: 150, w: 170, h: 66, t: "get_input_output", s: "skips traces\nwithout messages", k: "op" },
+          { id: "metrics", x: 440, y: 290, w: 170, h: 76, t: "5 rubric prompts", s: "conciseness, halluc.,\nhelpful, relevancy,\ntoxicity", k: "store" },
+          { id: "p_oa", x: 660, y: 40, w: 180, h: 34, t: "OpenAI (judge)", k: "port", goto: "openai" },
+          { id: "judge", x: 660, y: 140, w: 180, h: 86, t: "_call_openai", s: "≤ 4 at a time\nasync backoff · 3 tries", k: "code" },
+          { id: "push", x: 890, y: 150, w: 150, h: 66, t: "_push_to_langfuse", s: "create_score\nNUMERIC 0–1", k: "code" },
+          { id: "p_lf_out", x: 890, y: 40, w: 150, h: 34, t: "Langfuse", k: "port", goto: "langfuse" },
+          { id: "report", x: 890, y: 302, w: 150, h: 76, t: "JSON report", s: "per-metric average\n+ score direction", k: "store" }
+        ],
+        edges: [
+          { id: "v1", from: "cli", to: "fetch", pts: [[170, 183], [220, 183]], k: "msg", lab: null, sh: "Evaluator().run()" },
+          { id: "v2", from: "p_lf_in", to: "fetch", pts: [[305, 74], [305, 150]], k: "tel", lab: "traces", lp: [305, 112] },
+          { id: "v3", from: "fetch", to: "io", pts: [[390, 183], [440, 183]], k: "tel", lab: null, sh: "TraceWithDetails" },
+          { id: "v4", from: "io", to: "judge", pts: [[610, 183], [660, 183]], k: "msg", lab: null, sh: "'Input: … Generation: …'" },
+          { id: "v5", from: "metrics", to: "judge", pts: [[610, 328], [750, 328], [750, 226]], k: "msg", lab: "rubric", lp: [680, 328] },
+          { id: "v6", from: "judge", to: "p_oa", pts: [[750, 140], [750, 74]], k: "llm", lab: "parse()", lp: [750, 107] },
+          { id: "v7", from: "judge", to: "push", pts: [[840, 183], [890, 183]], k: "msg", lab: null, sh: "ScoreSchema {score, reasoning}" },
+          { id: "v8", from: "push", to: "p_lf_out", pts: [[965, 150], [965, 74]], k: "tel", lab: "create_score", lp: [965, 112] },
+          { id: "v9", from: "judge", to: "report", pts: [[810, 226], [810, 340], [890, 340]], k: "msg", lab: null, sh: "per-trace results, averages" }
+        ]
+      }
+    },
+
+    info: {
+      /* ----- system ----- */
+      client: {
+        what: "Anything that speaks HTTP: a web front end, <code>curl</code>, a load generator. It holds two kinds of JWT: a user token from register or login, and a session token from <code>POST /auth/session</code>. Only the session token opens the chatbot routes.",
+        io: [["out", "request", { chat: "POST /api/v1/chatbot/chat", stream: "POST /api/v1/chatbot/chat/stream" }, "JSON + Bearer"],
+             ["out", "body", "{messages: [{role: user|assistant, content}]}", "ChatRequest"],
+             ["in", "reply", { chat: "{messages: [{role, content}, …]}", stream: "data: {\"content\": …, \"done\": false}\\n\\n …" }, { chat: "application/json", stream: "text/event-stream" }]],
+        chat: "One JSON body once the graph has finished, with the whole thread (user and assistant messages), not only the new reply.",
+        stream: "Server-sent events: one frame per text chunk, then <code>{content: \"\", done: true}</code>. A failure ends with <code>done: true</code> and an <code>error</code> message.",
+        note: "Send only the new turn: the history already lives in the Postgres checkpointer, and resent messages would be stored again.",
+        code: [["src/interface/interaction.py", "34-63"], ["src/interface/interaction.py", "66-111"], ["src/data/schemas/chat.py", "71-83"]]
+      },
+      telem: {
+        what: "The telemetry containers: the OpenTelemetry Collector (receives traces, tails log files), Tempo (traces), Loki (logs), Prometheus (metrics), Grafana (dashboards and Explore), and cAdvisor (per-container resource metrics). Open it for the pipeline.",
+        code: [["docker-compose.yml", "78-85"], ["otel/collector.yaml", "5-52"]]
+      },
+      mw: {
+        tags: ["5 middlewares", "outer → inner"],
+        what: "Everything between the socket and the route handler: the OpenTelemetry request span, CORS, the logging context, request metrics and SlowAPI's default rate limits, then FastAPI routing, the auth dependency, body validation and the handler. Open it for the order.",
+        code: [["src/main.py", "116-129"], ["src/system/tracing.py", "46-80"], ["src/main.py", "133"]]
+      },
+      chatr: {
+        what: "Four routes, all behind <code>get_current_session</code>: <code>POST /chat</code> (30/min), <code>POST /chat/stream</code> (20/min), <code>GET /messages</code> and <code>DELETE /messages</code> (50/min each). Errors are logged with the request id; clients get a stable message.",
+        chat: "<code>chat()</code> awaits <code>agent.get_response</code> and returns <code>ChatResponse</code>.",
+        stream: "<code>chat_stream()</code> wraps <code>agent.get_stream_response</code> in a <code>StreamingResponse</code> with no-cache and no-buffering headers.",
+        code: [["src/interface/interaction.py", "34-63"], ["src/interface/interaction.py", "66-111"], ["src/interface/interaction.py", "114-137"], ["src/interface/router.py", "16-17"]]
+      },
+      authr: {
+        what: "Register, login, logout and session management. Mints every JWT with <code>create_access_token</code> and checks the token kind on each route. Open it for the flow.",
+        code: [["src/interface/auth.py", "163-196"], ["src/interface/auth.py", "199-233"], ["src/interface/auth.py", "236-253"]]
+      },
+      dbsvc: {
+        tags: ["async engine", "psycopg 3", "pool 20 + 10"],
+        what: "One process-wide service on SQLAlchemy's async engine, so queries never block the event loop. Used by the auth routes and by <code>get_current_session</code> on every chat call. Tables come from Alembic migrations, never from the app at startup, so schema changes are reviewed and versioned.",
+        io: [["in", "calls", "create_user, get_user, get_user_by_email, create_session, get_session, …", "Python"], ["out", "rows", "User, Session (SQLModel)", "Python"]],
+        code: [["src/data/db_manager.py", "35-51"], ["src/data/db_manager.py", "153-163"], ["src/data/db_manager.py", "223"], ["migrations/versions/20261029_0001_initial_schema.py", "35-55"]]
+      },
+      agent: {
+        tags: ["2 graph nodes", "1 tool"],
+        what: "Builds a two-node LangGraph (<code>chat</code> ↔ <code>tool_call</code>) once per process behind a lock, with a required <code>AsyncPostgresSaver</code> checkpointer keyed by the session id. Recalls long-term memories before each run and sends the new turn to mem0 after it.",
+        chat: "<code>get_response</code> → <code>graph.ainvoke</code> in a child task; errors propagate to the route.",
+        stream: "<code>get_stream_response</code> → <code>graph.astream(stream_mode='messages')</code>, yielding only the chat node's text.",
+        code: [["src/agent/workflow.py", "61-78"], ["src/agent/workflow.py", "269-300"], ["src/agent/workflow.py", "325-362"], ["src/agent/workflow.py", "382-417"]]
+      },
+      llmsvc: {
+        what: "Module-level <code>llm_service</code>: tenacity retries transient errors on one model, then the call moves to the next of five registered models. No state is shared between calls. Open it for the policy.",
+        code: [["src/services/llm_provider.py", "176-309"], ["src/services/llm_provider.py", "313"]]
+      },
+      mem0: {
+        tags: ["gpt-5-nano facts", "text-embedding-3-small"],
+        what: "mem0 <code>AsyncMemory</code>, built once (behind a lock) on first use: pgvector store (collection <code>longterm_memory</code>), a fact-extraction model and an embedder. <code>search</code> runs before every graph run; <code>add</code> runs after it with the new turn only.",
+        code: [["src/agent/workflow.py", "80-108"], ["src/agent/workflow.py", "142-160"], ["src/agent/workflow.py", "162-179"]]
+      },
+      redis: {
+        tags: ["appendonly", "maxmemory 256 MB"],
+        what: "Shared state for every worker and replica: slowapi's rate-limit counters and the <code>revoked_jti:&lt;jti&gt;</code> keys written by logout (each expires when its token would have). Persisted with append-only files, so logouts survive a restart.",
+        why: "Counters kept in process memory would give each uvicorn worker its own budget (N workers allow N times the limit), and a stateless JWT can only be revoked through a store every worker reads.",
+        note: "If Redis is down, rate limits fall back to per-process memory and the revocation check fails open (logged as <code>token_revocation_check_failed</code>); <code>/health/ready</code> reports it as degraded.",
+        code: [["src/system/cache.py", "17-26"], ["src/system/rate_limit.py", "20-26"], ["src/utils/auth.py", "121-137"], ["docker-compose.yml", "27-38"]]
+      },
+      t_app: {
+        what: "<code>user</code> (id, email unique, bcrypt <code>hashed_password</code>, created_at) and <code>session</code> (id = UUID4 string, user_id FK indexed, name, created_at). Created and changed only by Alembic migrations (<code>make migration</code> after a model change, <code>alembic upgrade head</code> on container start). The first migration is written to adopt tables that already exist.",
+        code: [["src/data/models/user.py", "20-44"], ["src/data/models/session.py", "19-34"], ["migrations/versions/20261029_0001_initial_schema.py", "35-55"], ["migrations/versions/20261029_0002_drop_unused_thread_table.py", "25-27"]]
+      },
+      t_ckpt: {
+        what: "Written by LangGraph's <code>AsyncPostgresSaver</code> after every step: <code>checkpoints</code>, <code>checkpoint_writes</code>, <code>checkpoint_blobs</code>. Thread id = chat session id. <code>GET /messages</code> reads it; <code>DELETE /messages</code> and <code>DELETE /auth/session/{id}</code> delete the thread's rows.",
+        note: "The input is checkpointed before the model runs, so a turn whose model call fails still leaves the user message in the thread.",
+        code: [["src/agent/workflow.py", "269-300"], ["src/agent/workflow.py", "444-461"]]
+      },
+      t_vec: {
+        what: "mem0's pgvector collection: one row per extracted fact with its embedding, scoped by <code>user_id</code>, so memories follow the user across sessions. Deleting a session or its messages leaves them in place.",
+        code: [["src/agent/workflow.py", "80-108"]]
+      },
+      langfuse: {
+        what: "LLM tracing. Each graph run gets a <code>CallbackHandler()</code>; user, session and tags come from the <code>langfuse_user_id</code>, <code>langfuse_session_id</code> and <code>langfuse_tags</code> metadata keys that Langfuse 3.x reads. The client is created after the OpenTelemetry provider and blocks infrastructure scopes, so it receives only LLM spans. The eval runner reads these traces and writes scores back.",
+        code: [["src/agent/workflow.py", "302-323"], ["src/system/tracing.py", "83-98"], ["src/main.py", "61"]]
+      },
+      openai: {
+        what: "All model traffic: the five chat models in <code>LLMRegistry</code>, mem0's fact extraction and embeddings, and the eval judge. Outbound calls are traced through the HTTPX instrumentation, so they appear in Tempo inside the request's trace.",
+        code: [["src/services/llm_provider.py", "51-161"], ["src/config/settings.py", "151-158"]]
+      },
+      ddg: {
+        what: "<code>DuckDuckGoSearchResults(num_results=10, handle_tool_error=True)</code>, bound to every registered model. Returns up to 10 results as one string. <code>handle_tool_error=True</code> turns search failures into a message the model can read.",
+        code: [["src/agent/tools/web_search.py", "10"], ["src/agent/tools/__init__.py", "12"]]
+      },
+      evals: {
+        what: "Offline CLI (<code>make eval</code>): pages through the last 24 h of unscored traces, scores each against five rubric prompts with a judge model, pushes the scores back to Langfuse and writes a JSON report. Open it for the steps.",
+        code: [["evals/main.py", "168-190"], ["evals/evaluator.py", "64-103"]]
+      },
+      r_req: {
+        t: "Chat request",
+        what: "The only request shape the chatbot routes take. A user token is rejected with 401 (wrong <code>typ</code>).",
+        io: [["in", "Authorization", "Bearer <session JWT>", "header"], ["in", "X-Request-ID", "optional, ≤ 64 plain chars", "header"], ["in", "messages", "list[ChatMessage], at least 1", "JSON"], ["in", "ChatMessage", "{role: user | assistant, content: 1–3000 chars}", "pydantic"]],
+        code: [["src/data/schemas/chat.py", "31-68"], ["src/data/schemas/chat.py", "71-83"]]
+      },
+      r_res: {
+        t: "Reply",
+        io: [["out", "body", { chat: "{messages: list[Message]}", stream: "data: {content, done, error}\\n\\n" }, { chat: "application/json", stream: "text/event-stream" }], ["out", "X-Request-ID", "echoed or generated", "header"]],
+        what: { chat: "<code>ChatResponse</code> with every user and assistant message in the thread that has text; tool calls and tool results are left out. Messages have no length cap.", stream: "One SSE frame per text chunk from the chat node, then a final <code>done: true</code> frame." },
+        code: [["src/data/schemas/chat.py", "17-28"], ["src/data/schemas/chat.py", "96-107"]]
+      },
+      s_chat_agent: { t: "Handler calls the agent", io: [["in", "messages", "list[ChatMessage]", "pydantic"], ["in", "session_id", "str (uuid4)", ""], ["in", "user_id", "int", ""]] },
+      s_mw_redis: { t: "Rate-limit counters", what: "slowapi (route decorators and <code>SlowAPIASGIMiddleware</code>) counts requests per client IP in Redis, so all workers share one budget.", see: ["limiter", "slowmw"] },
+      s_auth_redis: { t: "Revoked tokens", what: "Every authenticated route checks <code>revoked_jti:&lt;jti&gt;</code>; logout sets it with a TTL that ends when the token would have expired.", see: ["verify", "logout"] },
+      s_mw_telem: { t: "Telemetry out of the app", what: "Three channels: OTLP traces pushed to the collector, JSON log files the collector tails from a shared volume, and <code>/metrics</code> pulled by Prometheus.", see: ["collector"] },
+      s_agent_ckpt: { t: "Checkpoint read and write", what: "At the start of a run LangGraph loads the latest checkpoint for <code>thread_id</code>; after each node it writes a new one." },
+      s_llm_openai: {
+        t: "Chat model call",
+        what: { chat: "<code>ainvoke</code> on the chosen model with tools bound; one <code>AIMessage</code> back.", stream: "Same <code>ainvoke</code> call; LangGraph's stream callback makes LangChain stream from the API and each chunk is emitted as it arrives." },
+        code: [["src/services/llm_provider.py", "245-270"]]
+      },
+      s_mem0_openai: { t: "mem0's own model calls", what: "<code>search</code> embeds the query; <code>add</code> sends the new turn to the fact-extraction model and embeds new facts. These calls bypass <code>LLMService</code>." },
+      s_agent_lf: { t: "LLM spans to Langfuse", what: "The callback handler in the run config reports each graph node and model call. Langfuse shares the app's OpenTelemetry provider but only exports its own spans." },
+      s_evals_lf: { t: "Eval runner ⇄ Langfuse", what: "Two API calls on one wire: <code>trace.list</code> page by page, and <code>create_score</code>. The arrow points at the API being called.", see: ["fetch", "push"] },
+      s_evals_oa: { t: "Judge model calls", what: "<code>beta.chat.completions.parse</code> with <code>response_format=ScoreSchema</code>, one call per trace per rubric, at most <code>EVALUATION_CONCURRENCY</code> at a time.", see: ["judge"] },
+
+      /* ----- http ----- */
+      p_in: { what: "The request as it arrives from the client." },
+      p_out: { what: "The response leaves back through the same middlewares in reverse." },
+      otelmw: {
+        what: "Added by <code>FastAPIInstrumentor.instrument_app</code>, which wraps the whole middleware stack, so the request span covers everything below. Health and metrics URLs are excluded. Present only when <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> is set.",
+        code: [["src/system/tracing.py", "46-80"]]
+      },
+      cors: {
+        what: "Outermost of the app's own middleware. <code>allow_origins</code> comes from <code>ALLOWED_ORIGINS</code>; credentials are allowed only when that list has no <code>*</code>. Exposes <code>X-Request-ID</code> to browsers.",
+        code: [["src/main.py", "123-129"]]
+      },
+      lcm: {
+        what: "Starts a fresh log context per request: a <code>request_id</code> (from <code>X-Request-ID</code> if short and plain, else a UUID, echoed in the response), the request's <code>trace_id</code>, and the session or user id from the token's <code>typ</code>. Plain ASGI, so context set later by dependencies is visible to every log in the request; the previous context is restored at the end.",
+        why: "Binding the trace id here keeps it on every log line even after LangChain callback handlers swap the active span during a graph run.",
+        code: [["src/system/middleware.py", "88-140"], ["src/system/logs.py", "46-55"]]
+      },
+      mmw: {
+        what: "Counts and times every request by method, <b>route template</b> (for example <code>/api/v1/auth/session/{session_id}</code>) and status. Plain ASGI: the timer stops after the last body chunk, so a stream is measured for its full length.",
+        code: [["src/system/middleware.py", "56-85"], ["src/system/telemetry.py", "33-38"]]
+      },
+      slowmw: {
+        what: "Applies <code>RATE_LIMIT_DEFAULT</code> to every route without its own <code>@limiter.limit</code>. Decorated routes are left to their decorator; <code>/metrics</code> and the health probes are exempt.",
+        code: [["src/main.py", "119"], ["src/system/rate_limit.py", "20-26"]]
+      },
+      logs: {
+        what: "structlog with a <code>ProcessorFormatter</code> on both handlers, so library logs get the same fields. stdout is console or JSON; the file handler always writes JSON to <code>logs/&lt;env&gt;-&lt;UTC day&gt;.jsonl</code>, recomputing the name on every write. Every event carries the request context and, when tracing, <code>trace_id</code> and <code>span_id</code>.",
+        code: [["src/system/logs.py", "216-268"], ["src/system/logs.py", "156-175"], ["src/system/logs.py", "110-125"]]
+      },
+      p_redisv: { what: "Redis: the revoked-token keys." },
+      p_redisl: { what: "Redis: the rate-limit counters." },
+      bearer: {
+        what: "FastAPI's <code>HTTPBearer</code> security scheme, a sub-dependency of the auth dependencies. Reads <code>Authorization: Bearer …</code> and rejects requests without it.",
+        io: [["in", "header", "Authorization: Bearer <jwt>", "HTTP"], ["out", "credentials", "HTTPAuthorizationCredentials", "Python"]],
+        code: [["src/interface/auth.py", "60"]]
+      },
+      sessdep: {
+        what: "Declared with <code>Depends</code> on every chatbot route and on the per-session routes. Verifies the token (it must have <code>typ = session</code>), checks it isn't revoked, loads the session row, and binds the user and session ids to the log context.",
+        io: [["in", "token", "str (JWT)", "header"], ["out", "session", "Session(id, user_id, name, created_at)", "SQLModel"]],
+        fig: "<table class=\"mini\"><thead><tr><th>case</th><th>result</th></tr></thead><tbody><tr><td>bad signature, expired, wrong typ</td><td>401</td></tr><tr><td>revoked by logout</td><td>401</td></tr><tr><td>not three base64url parts</td><td>422</td></tr><tr><td>session row gone</td><td>404</td></tr><tr><td>found</td><td>Session</td></tr></tbody></table>",
+        code: [["src/interface/auth.py", "122-146"], ["src/interface/auth.py", "66-89"]]
+      },
+      verify: {
+        what: "<code>verify_token</code>: regex check for three base64url segments, <code>jose.jwt.decode</code> with HS256, then the claims must include <code>sub</code> and <code>jti</code> and the expected <code>typ</code>. <code>is_token_revoked</code> then looks up <code>revoked_jti:&lt;jti&gt;</code> in Redis.",
+        why: "The <code>typ</code> claim keeps the two token kinds from being used in each other's place.",
+        code: [["src/utils/auth.py", "70-106"], ["src/utils/auth.py", "121-137"]]
+      },
+      dbget: {
+        what: "<code>DatabaseService.get_session(id)</code>: a primary-key lookup on the async engine.",
+        io: [["in", "session_id", "str", ""], ["out", "row", "Session | None", "SQLModel"]],
+        code: [["src/data/db_manager.py", "153-163"]]
+      },
+      bindctx: { what: "Merges <code>user_id</code> and <code>session_id</code> into the request's log context.", code: [["src/system/logs.py", "67-74"]] },
+      errors: {
+        what: "Where a request can stop before the handler.",
+        fig: "<table class=\"mini\"><thead><tr><th>from</th><th>status</th></tr></thead><tbody><tr><td>HTTPBearer, no header</td><td>401/403</td></tr><tr><td>auth dependency</td><td>401 · 404 · 422</td></tr><tr><td>body validation</td><td>422 {detail, errors[]}</td></tr><tr><td>slowapi</td><td>429</td></tr><tr><td>handler exception</td><td>500, generic detail</td></tr></tbody></table>",
+        code: [["src/main.py", "85-113"]]
+      },
+      validate: {
+        what: "Pydantic parses the body as <code>ChatRequest</code>: at least one <code>ChatMessage</code>; role is user or assistant (system is rejected); content 1–3000 chars, no <code>&lt;script&gt;</code> tags, no null bytes. Failures return 422 with one <code>{field, message}</code> per error.",
+        why: "FastAPI solves dependencies before it validates the body, so authentication happens first.",
+        code: [["src/data/schemas/chat.py", "31-68"], ["src/main.py", "85-113"]]
+      },
+      limiter: {
+        what: "slowapi decorator on the route, keyed by client IP and counted in Redis (<code>RATE_LIMIT_STORAGE_URI</code>), so every worker and replica shares the budget. Behind a proxy, set <code>FORWARDED_ALLOW_IPS</code> so uvicorn takes the IP from <code>X-Forwarded-For</code>.",
+        chat: "30 per minute (<code>RATE_LIMIT_CHAT</code>).",
+        stream: "20 per minute (<code>RATE_LIMIT_CHAT_STREAM</code>).",
+        code: [["src/system/rate_limit.py", "20-26"], ["src/interface/interaction.py", "34-63"]]
+      },
+      handler: {
+        chat: "<code>chat()</code> awaits <code>agent.get_response</code>. A failure is logged with its cause and request id and returned as 500 <code>Failed to process chat request</code>.",
+        stream: "<code>chat_stream()</code> returns a <code>StreamingResponse</code> over <code>event_generator()</code>, which frames each text chunk as <code>data: {json}\\n\\n</code>, records <code>llm_stream_duration_seconds</code> in <code>finally</code>, and ends a failed stream with an <code>error</code> frame.",
+        note: { stream: "The stream duration is labelled with the default model even when a fallback model answered." },
+        code: { chat: [["src/interface/interaction.py", "34-63"]], stream: [["src/interface/interaction.py", "66-111"]] }
+      },
+      p_agent: { what: "Into the agent's <code>get_response</code> / <code>get_stream_response</code>." },
+      resp: {
+        chat: "<code>ChatResponse(messages=[…])</code>, serialized by FastAPI.",
+        stream: "Frames as they are generated, with <code>Cache-Control: no-cache</code> and <code>X-Accel-Buffering: no</code>.",
+        fig: { chat: "<pre>{\"messages\": [\n  {\"role\": \"user\", \"content\": \"…\"},\n  {\"role\": \"assistant\", \"content\": \"…\"}\n]}</pre>", stream: "<pre>data: {\"content\":\"Hel\",\"done\":false,\"error\":null}\n\ndata: {\"content\":\"lo\",\"done\":false,\"error\":null}\n\ndata: {\"content\":\"\",\"done\":true,\"error\":null}</pre>" },
+        code: [["src/data/schemas/chat.py", "86-93"], ["src/data/schemas/chat.py", "96-107"]]
+      },
+      h15: { t: "Response to the client", io: [["out", "body", { chat: "ChatResponse", stream: "SSE frames" }, { chat: "application/json", stream: "text/event-stream" }]] },
+      h16: { t: "Validation error", what: "422 <code>{detail: \"Validation error\", errors: [{field, message}]}</code>." },
+      h17: { t: "Rate limit exceeded", what: "slowapi's handler returns 429 with the limit in the message." },
+      h19: { t: "Request context", what: "Set before routing: request id, trace id, and the id from the token (unverified at this point; only used to label logs)." },
+
+      /* ----- agent ----- */
+      p_req: { what: "From the route handler: the new messages, the session id and the user id." },
+      memsearch: {
+        what: "<code>mem0.search</code> scoped to <code>user_id</code>, with the last message as the query. Facts become bullet lines; the count is logged at debug, the content never is. Errors return an empty string, which the caller replaces with \"No relevant memory found.\"",
+        io: [["in", "query", "messages[-1].content", "str"], ["out", "memory", "\"* fact\\n* fact\"", "str"]],
+        code: [["src/agent/workflow.py", "142-160"]]
+      },
+      p_mem0: { what: "mem0 search against the user's pgvector memories." },
+      cfg: {
+        what: "Run config built by <code>_build_config</code>: <code>configurable.thread_id = session_id</code> picks the checkpoint thread; <code>callbacks</code> holds a plain <code>CallbackHandler()</code>; <code>metadata</code> carries <code>langfuse_user_id</code>, <code>langfuse_session_id</code> and <code>langfuse_tags</code>, which Langfuse 3.x turns into trace attributes. Same config for both endpoints.",
+        code: [["src/agent/workflow.py", "302-323"]]
+      },
+      inp: {
+        what: "<code>{\"messages\": dump_messages(messages), \"long_term_memory\": text}</code>, merged into the checkpointed state for this thread. <code>add_messages</code> appends the new messages; <code>long_term_memory</code> is overwritten.",
+        code: [["src/agent/workflow.py", "325-362"], ["src/data/schemas/graph.py", "12-18"]]
+      },
+      chatnode: { what: "Node <code>chat</code>: fills the system prompt with the recalled memories, trims the history, calls the LLM service, and returns a <code>Command</code> that appends the reply and routes to <code>tool_call</code> or END. Open it for the steps.", code: [["src/agent/workflow.py", "209-247"]] },
+      p_llm: { what: "The chat node's model call goes through <code>LLMService.call</code>." },
+      g_end: { what: "Reached when the chat node's reply has no tool calls.", code: [["src/agent/workflow.py", "285-288"]] },
+      toolnode: {
+        what: "For each tool call on the last AI message, awaits the tool by name (one after another) and wraps the result in a <code>ToolMessage</code>. An unknown tool name is returned to the model as an error message, so it can recover. Always routes back to <code>chat</code>.",
+        why: "LangGraph's recursion limit (25 steps by default) caps chat ↔ tool_call loops.",
+        stream: "Tool results are kept out of the stream: only the chat node's text is forwarded.",
+        code: [["src/agent/workflow.py", "249-267"]]
+      },
+      p_ddg: { what: "DuckDuckGo search tool." },
+      state: { what: "<code>GraphState</code> (pydantic): <code>messages</code> with the <code>add_messages</code> reducer, and <code>long_term_memory: str</code>. Loaded from the checkpointer when a run starts and saved after every step.", code: [["src/data/schemas/graph.py", "12-18"]] },
+      saver: {
+        what: "<code>AsyncPostgresSaver</code> over a psycopg <code>AsyncConnectionPool</code> (max <code>POSTGRES_POOL_SIZE</code>, autocommit, no prepared statements). The checkpointer is required: if the pool can't open, the request fails rather than running a graph that would forget the conversation.",
+        code: [["src/agent/workflow.py", "110-140"]]
+      },
+      graphinit: { what: "Runs once per process, guarded by an <code>asyncio.Lock</code> so concurrent first requests don't build two graphs or two pools.", code: [["src/agent/workflow.py", "269-300"]] },
+      p_ckpt: { what: "Postgres checkpoint tables." },
+      out_proc: { what: "Converts the final state's messages to OpenAI format and keeps user and assistant messages that have text (content blocks are reduced to text). The result is the whole thread.", code: [["src/agent/workflow.py", "432-442"]] },
+      out_tok: {
+        what: "For each <code>(chunk, metadata)</code> from the messages stream, keeps only AI messages from the <code>chat</code> node and reduces their content blocks to text. Tool results and reasoning blocks never reach the client.",
+        code: [["src/agent/workflow.py", "364-380"], ["src/agent/workflow.py", "382-417"]]
+      },
+      p_resp: { what: "Back to the route handler." },
+      memupd: {
+        what: "Builds this turn (the user messages the client sent and the final assistant reply) and hands it to <code>_update_long_term_memory</code> in an <code>asyncio</code> task. The task is kept in <code>_background_tasks</code> until it finishes, and shutdown waits up to 10 s for pending ones.",
+        chat: "The final reply comes from the <code>ainvoke</code> result.",
+        stream: "The final reply comes from <code>graph.aget_state()</code> after the stream ends.",
+        code: [["src/agent/workflow.py", "181-207"], ["src/agent/workflow.py", "463-469"]]
+      },
+      p_mem0b: { what: "mem0 add: fact extraction, embedding, pgvector upsert." },
+      ag_chat_tok: { t: "Streamed chunks", what: "Emitted by LangGraph's messages-mode callback while the model call is in flight, then filtered by <code>_stream_text</code>." },
+      ag_end_memupd: { t: "New turn to the memory update" },
+
+      /* ----- chat node ----- */
+      p_state: { what: "Current <code>GraphState</code> for the thread." },
+      sysprompt: {
+        what: "Reads <code>prompts/system.md</code> and fills it with <code>str.format</code>.",
+        fig: "<pre># Name: {agent_name}\n# Role: A world class assistant\nHelp the user with their questions.\n\n# Instructions\n- Always be friendly and professional.\n- If you don't know the answer, say you don't know. …\n\n# What you know about the user\n{long_term_memory}\n\n# Current date and time\n{current_date_and_time}</pre>",
+        code: [["src/agent/prompts/__init__.py", "9-16"]]
+      },
+      prep: {
+        what: "<code>trim_messages</code> keeps the most recent messages that fit in <code>MAX_CONTEXT_TOKENS</code>, starting on a human message, then a <code>SystemMessage</code> goes in front. The history budget is separate from <code>MAX_TOKENS</code>, which caps the reply.",
+        code: [["src/utils/graph.py", "78-115"]]
+      },
+      llmcall: { what: "<code>self.llm_service.call(messages)</code>. Latency is recorded inside the service, per attempt that succeeds, labelled with the model that answered. Open it for retries and fallback.", code: [["src/agent/workflow.py", "209-247"]] },
+      proc: { what: "When <code>content</code> is a list of blocks (GPT-5 reasoning output), keeps the text blocks and drops reasoning blocks.", code: [["src/utils/graph.py", "55-75"], ["src/utils/graph.py", "29-52"]] },
+      route: { what: "Non-empty <code>tool_calls</code>: <code>Command(update={messages: [reply]}, goto=\"tool_call\")</code>. Otherwise <code>goto=END</code>.", code: [["src/agent/workflow.py", "245-247"]] },
+      p_tool: { what: "To the tool_call node." },
+      p_end: { what: "Graph end." },
+      hist: { what: "Prometheus histogram <code>llm_inference_duration_seconds</code>, label <code>model</code>, buckets from 0.25 s to 120 s.", code: [["src/system/telemetry.py", "41-46"]] },
+      p_stream: { what: "Stream mode only: chunks leave here, during the call." },
+      c10: { t: "Chunks during the call", what: "LangGraph's messages-mode callback forwards each chunk as the model produces it." },
+
+      /* ----- LLM service ----- */
+      p_llmin: { what: "Messages from the chat node." },
+      callfn: {
+        what: "Starts at the default model (or a requested one) and tries each registered model at most once. The position is a local loop variable, so one request's failover never changes where the next request starts. After the last model fails, raises <code>RuntimeError</code> chained to the last error.",
+        code: [["src/services/llm_provider.py", "272-309"]]
+      },
+      retry: {
+        what: "tenacity <code>AsyncRetrying</code>: <code>MAX_LLM_CALL_RETRIES</code> attempts with exponential wait clamped to 2–10 s, only for <code>RateLimitError</code>, <code>APIConnectionError</code> (including timeouts) and <code>InternalServerError</code>. Records the latency of a successful call per model.",
+        code: [["src/services/llm_provider.py", "245-270"], ["src/services/llm_provider.py", "43"]]
+      },
+      p_openai: { what: "OpenAI API." },
+      errclass: {
+        what: "What happens to an <code>OpenAIError</code>. Transient errors that survive their retries, and <code>NotFoundError</code> / <code>PermissionDeniedError</code> (this model unavailable to this key) move on to the next model and increment <code>llm_fallbacks_total{model, error}</code>. Anything else (400 bad request, 401 bad key, 422) would fail on every model, so it is raised to the caller at once.",
+        code: [["src/services/llm_provider.py", "48"], ["src/system/telemetry.py", "55-59"]]
+      },
+      bound: {
+        what: "Each registry model with the agent's tools bound, created on first use and cached by name. <code>bind_tools</code> stores the tool list and clears the cache, so the fallback models can call web search like the default one.",
+        code: [["src/services/llm_provider.py", "221-236"], ["src/services/llm_provider.py", "238-243"]]
+      },
+      fail: { what: "<code>RuntimeError(\"failed to get response from llm after trying 5 models\")</code>, raised from the last error. The chat node logs it and re-raises.", code: [["src/services/llm_provider.py", "272-309"]] },
+      reg: {
+        what: "Five pre-built <code>ChatOpenAI</code> instances, created at import. The start index is <code>DEFAULT_LLM_MODEL</code> (code default <code>gpt-5-mini</code>; <code>.env.example</code> sets <code>gpt-4o-mini</code>, index 4, so the next model is index 0).",
+        fig: "<svg viewBox=\"0 0 260 150\" role=\"img\" aria-label=\"Fallback order of five models\"><g fill=\"none\" stroke=\"var(--muted)\" stroke-width=\"1.2\"><circle cx=\"130\" cy=\"75\" r=\"52\" stroke-dasharray=\"4 4\"/></g><g font-family=\"var(--font-mono)\" font-size=\"10\" fill=\"var(--ink)\" text-anchor=\"middle\"><circle cx=\"130\" cy=\"23\" r=\"5\" fill=\"var(--llm)\"/><text x=\"130\" y=\"12\">0 gpt-5-mini</text><circle cx=\"179\" cy=\"59\" r=\"5\" fill=\"var(--surface)\" stroke=\"var(--llm)\"/><text x=\"222\" y=\"62\">1 gpt-5</text><circle cx=\"161\" cy=\"117\" r=\"5\" fill=\"var(--surface)\" stroke=\"var(--llm)\"/><text x=\"190\" y=\"138\">2 gpt-5-nano</text><circle cx=\"99\" cy=\"117\" r=\"5\" fill=\"var(--surface)\" stroke=\"var(--llm)\"/><text x=\"72\" y=\"138\">3 gpt-4o</text><circle cx=\"81\" cy=\"59\" r=\"5\" fill=\"var(--surface)\" stroke=\"var(--llm)\"/><text x=\"40\" y=\"62\">4 gpt-4o-mini</text></g></svg><p class=\"cap\">Each call walks clockwise from the default, at most once around.</p>",
+        code: [["src/services/llm_provider.py", "60-110"]]
+      },
+      l4: { t: "Call failed", what: "The error leaves tenacity (after retries, for transient errors) and <code>call()</code> decides: next model, or raise." },
+      l9: { t: "Raised to the caller", what: "400, 401 and 422 propagate unchanged: retrying or switching models would not help." },
+
+      /* ----- auth ----- */
+      p_cli: { what: "The client." },
+      reg: {
+        what: "Normalizes the email (format check, lowercase), checks password strength, rejects a taken email (400), stores a bcrypt hash of the password exactly as typed, and returns <code>UserResponse{id, email, token}</code> with a user token.",
+        io: [["in", "body", "{email, password (8–64)}", "UserCreate"], ["out", "body", "{id, email, token: Token}", "UserResponse"]],
+        code: [["src/interface/auth.py", "163-196"]]
+      },
+      login: {
+        what: "OAuth2-style form. The email gets the same normalization as at registration; the password is compared exactly as typed. An unknown email, a malformed one or a wrong password all return the same 401.",
+        io: [["in", "form", "username, password, grant_type", "x-www-form-urlencoded"], ["out", "body", "{access_token, token_type, expires_at}", "TokenResponse"]],
+        code: [["src/interface/auth.py", "199-233"]]
+      },
+      sess: {
+        what: "Needs a user token. Creates a session row with a fresh UUID4 and returns <code>SessionResponse{session_id, name, token}</code> with a session token (<code>typ = session</code>), the kind the chatbot routes accept.",
+        io: [["in", "header", "Bearer <user JWT>", "HTTP"], ["out", "body", "{session_id, name, token: Token}", "SessionResponse"]],
+        code: [["src/interface/auth.py", "256-279"]]
+      },
+      pwcheck: { what: "8–64 characters, one upper, one lower, one digit, one symbol. Checked in the <code>UserCreate</code> validator and again in <code>validate_password_strength</code>.", code: [["src/data/schemas/auth.py", "43-86"], ["src/utils/sanitization.py", "102-129"]] },
+      bcrypt: { what: "<code>User.hash_password</code> (bcrypt with a fresh salt) and <code>User.verify_password</code> (<code>checkpw</code>).", code: [["src/data/models/user.py", "20-44"]] },
+      getuser: { what: "Verifies a <b>user</b> token (and that it isn't revoked), parses <code>sub</code> as an int and loads the user (404 if missing).", code: [["src/interface/auth.py", "92-119"]] },
+      jwt: {
+        what: "Claims <code>sub</code>, <code>typ</code>, <code>exp</code> (now + <code>JWT_ACCESS_TOKEN_EXPIRE_DAYS</code>, default 30), <code>iat</code>, and a random <code>jti</code> used for revocation; HS256 with <code>JWT_SECRET_KEY</code>, which the app refuses to start without.",
+        fig: "<table class=\"mini\"><thead><tr><th>typ</th><th>sub</th><th>accepted by</th></tr></thead><tbody><tr><td>user</td><td>user.id</td><td>/session, /sessions, /logout</td></tr><tr><td>session</td><td>session id</td><td>/chatbot/*, PATCH, DELETE, /logout</td></tr></tbody></table>",
+        code: [["src/utils/auth.py", "41-67"], ["src/config/settings.py", "243-255"]]
+      },
+      p_db: { what: "DatabaseService and the user and session tables." },
+      sessops: {
+        what: "<code>PATCH</code> renames the caller's session (403 for any other id). <code>DELETE</code> removes the session row and its checkpoints. <code>GET /sessions</code> lists the user's sessions with a fresh session token for each. All rate-limited at 30/min.",
+        code: [["src/interface/auth.py", "282-306"], ["src/interface/auth.py", "309-332"], ["src/interface/auth.py", "335-355"]]
+      },
+      logout: {
+        what: "Accepts either token kind, verifies it, and stores <code>revoked_jti:&lt;jti&gt;</code> in Redis until the token's expiry. Every authenticated route checks that key, so the token stops working immediately. Returns 503 if Redis is unreachable.",
+        code: [["src/interface/auth.py", "236-253"], ["src/utils/auth.py", "109-118"]]
+      },
+      p_redisa: { what: "Redis: revoked-token keys." },
+      a6: { t: "Password check at login", what: "<code>user.verify_password(password)</code> on the form value exactly as typed, matching how it was hashed at registration." },
+      a12: { t: "Token back to the client", io: [["out", "token", "{access_token: str, token_type: \"bearer\", expires_at: datetime}", "JSON"]] },
+
+      /* ----- telemetry ----- */
+      otelinst: {
+        what: "Installed by <code>setup_tracing</code> when <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> is set: a global <code>TracerProvider</code> with a batch OTLP/HTTP exporter, plus instrumentation for FastAPI, the async SQLAlchemy engine, Redis and HTTPX (which covers the OpenAI SDK). Resource attributes: service name, version, environment.",
+        code: [["src/system/tracing.py", "46-80"]]
+      },
+      lfclient: {
+        what: "<code>init_langfuse</code> runs after <code>setup_tracing</code>, so Langfuse attaches to the same provider, and passes <code>blocked_instrumentation_scopes</code> so FastAPI, ASGI, SQLAlchemy, Redis and HTTPX spans stay out of Langfuse. Flushed on shutdown.",
+        code: [["src/system/tracing.py", "83-98"], ["src/system/tracing.py", "37-43"]]
+      },
+      logsys: {
+        what: "One JSON object per line in <code>logs/&lt;env&gt;-&lt;UTC day&gt;.jsonl</code>, on a volume the collector also mounts. Fields include <code>event</code>, <code>level</code>, <code>timestamp</code>, <code>request_id</code>, <code>trace_id</code>, <code>span_id</code>, and the user and session ids.",
+        code: [["src/system/logs.py", "216-268"], ["src/system/logs.py", "110-125"]]
+      },
+      metmod: {
+        what: "Request counts and durations by route template, LLM call and stream durations, and fallback counts. With <code>PROMETHEUS_MULTIPROC_DIR</code> set (the image sets it), every uvicorn worker writes its samples there and <code>/metrics</code> merges them, so a scrape sees all workers.",
+        code: [["src/system/telemetry.py", "62-69"], ["src/system/middleware.py", "56-85"], ["scripts/docker-entrypoint.sh", "83-86"]]
+      },
+      p_langfuse: { what: "Langfuse (hosted)." },
+      collector: {
+        what: "<code>otel/opentelemetry-collector-contrib</code>. Receives OTLP from the app and forwards traces to Tempo. Its <code>filelog</code> receiver tails the app's JSON log files, parses each line, takes severity from <code>level</code> and the trace context from <code>trace_id</code>/<code>span_id</code>, and sends the records to Loki's OTLP endpoint.",
+        code: [["otel/collector.yaml", "5-38"], ["otel/collector.yaml", "50-60"]]
+      },
+      cadvisor: { what: "Exports CPU, memory, network and filesystem usage per container.", code: [["docker-compose.yml", "138-147"]] },
+      tempo: { what: "Grafana Tempo, single binary with local storage under <code>/tmp/tempo</code> and 72 h retention. Use object storage for anything you need to keep.", code: [["otel/tempo.yaml", "3-17"]] },
+      loki: { what: "Grafana Loki 3 with its default single-node config; logs arrive through its native OTLP endpoint, and <code>trace_id</code> is kept as structured metadata.", code: [["docker-compose.yml", "98-103"]] },
+      prometheus: { what: "Scrapes the app's <code>/metrics</code>, cAdvisor and Tempo every 15 s.", code: [["prometheus/prometheus.yml", "5-18"]] },
+      grafana: {
+        what: "Datasources (Prometheus, Tempo, Loki) and the <i>Agentic API</i> dashboard are provisioned from the repo. Tempo links a span to its log lines (filtered by trace id); Loki's derived field turns <code>trace_id</code> into a link to the trace. The admin password must be set.",
+        code: [["grafana/provisioning/datasources/datasources.yml", "4-39"], ["grafana/dashboards/llm_latency.json", "3"]]
+      },
+      o1: { t: "Traces to the collector", what: "Batched OTLP over HTTP to <code>http://otel-collector:4318/v1/traces</code>." },
+      o2: { t: "Log files to the collector", what: "The app writes, the collector reads: both mount the <code>app-logs</code> volume." },
+      o5: { t: "Prometheus scrape", what: "Pull, not push: Prometheus requests <code>/metrics</code> every 15 s. The route is exempt from rate limits." },
+
+      /* ----- evals ----- */
+      cli: { what: "<code>python -m evals.main</code> with <code>--interactive</code>, <code>--quick</code> or <code>--no-report</code>. The summary counts skipped traces separately and shows each metric's direction.", code: [["evals/main.py", "253-268"], ["evals/main.py", "116-165"]] },
+      p_lf_in: { what: "Langfuse public API (host from <code>LANGFUSE_HOST</code>)." },
+      fetch: { what: "<code>trace.list</code> page by page (100 per page) from 24 hours ago, keeping unscored traces until <code>EVALUATION_MAX_TRACES</code>.", code: [["evals/evaluator.py", "204-226"]] },
+      io: { what: "From <code>trace.output[\"messages\"]</code>: all but the last message become the input transcript, the last one the output. Accepts LangChain-serialized and OpenAI-style messages; traces with no messages are skipped, not counted as failures.", code: [["evals/helpers.py", "61-75"], ["evals/helpers.py", "35-58"]] },
+      metrics: { what: "Every <code>.md</code> file in <code>evals/metrics/prompts</code> becomes a metric named after the file, scored 0–1. For hallucination and toxicity a higher score is worse; the report says so per metric.", code: [["evals/metrics/__init__.py", "6"], ["evals/helpers.py", "21"]] },
+      p_oa: { what: "OpenAI-compatible endpoint at <code>EVALUATION_BASE_URL</code>." },
+      judge: {
+        what: "<code>client.beta.chat.completions.parse(model=EVALUATION_LLM, response_format=ScoreSchema)</code> with the rubric as system prompt. At most <code>EVALUATION_CONCURRENCY</code> calls run at once; a failure waits <code>EVALUATION_SLEEP_TIME</code> with <code>asyncio.sleep</code> and retries up to 3 times.",
+        io: [["out", "score", "ScoreSchema {score: float 0–1, reasoning: str}", "JSON schema"]],
+        code: [["evals/evaluator.py", "173-202"], ["evals/schemas.py", "9-13"]]
+      },
+      push: { what: "<code>langfuse.create_score(trace_id, name=metric, data_type=\"NUMERIC\", value, comment=reasoning)</code>. A scored trace is skipped on the next run.", code: [["evals/evaluator.py", "138-152"]] },
+      p_lf_out: { what: "Langfuse public API." },
+      report: { what: "<code>evals/reports/evaluation_report_YYYYMMDD_HHMMSS.json</code>: totals (including skipped), per-metric counts, average and <code>higher_is_better</code>, and per-trace details.", code: [["evals/helpers.py", "195-217"], ["evals/helpers.py", "101-115"]] }
+    },
+
+    traces: {
+      chat: [
+        { t: "Sign up and log in", view: "auth", n: ["p_cli", "reg", "login", "pwcheck", "bcrypt", "jwt"], e: ["a1", "a2", "a4", "a5", "a6", "a7", "a8", "a12"], sel: "login", cap: "Register hashes the password as typed; login checks the same bytes and returns a <b>user</b> token (<code>typ = user</code>)." },
+        { t: "Open a chat session", view: "auth", n: ["p_cli", "sess", "getuser", "jwt", "p_db"], e: ["a3", "a9", "a10", "a11", "a13", "a12"], sel: "sess", cap: "With the user token, <code>POST /auth/session</code> creates a session row and returns a <b>session</b> token. Chat routes accept only this kind." },
+        { t: "Send a message", view: "system", n: ["client", "mw", "chatr"], e: ["r_req", "s_mw_chat"], sel: "r_req", cap: "<code>POST /api/v1/chatbot/chat</code> with the session token and the new turn. The history is kept on the server." },
+        { t: "Pass the middleware", view: "http", n: ["p_in", "otelmw", "cors", "lcm", "mmw", "slowmw"], e: ["h1", "h1b", "h2", "h3", "h4", "h19"], sel: "lcm", cap: "The request span opens, then CORS, the log context (request id, trace id), the metrics timer and SlowAPI's default limits." },
+        { t: "Authenticate the session", view: "http", n: ["bearer", "sessdep", "verify", "p_redisv", "dbget", "bindctx"], e: ["h5", "h6", "h7", "h8", "h9", "h20"], sel: "sessdep", cap: "The token must be a session token and not revoked; then the session row is loaded and the ids are bound to the logs." },
+        { t: "Validate, then rate-limit", view: "http", n: ["validate", "limiter", "p_redisl", "errors", "handler"], e: ["h10", "h11", "h12", "h16", "h17", "h21"], sel: "limiter", cap: "The body becomes a <code>ChatRequest</code> (422 on failure); the call is counted in Redis against 30 per minute for this IP, shared by every worker." },
+        { t: "Recall long-term memory", view: "agent", n: ["p_req", "memsearch", "p_mem0", "inp", "cfg"], e: ["ag_req_mem", "ag_mem_q", "ag_mem_inp", "ag_req_inp", "ag_req_cfg"], sel: "memsearch", cap: "mem0 searches the user's stored facts with the last message as the query. The hits become one text field in the graph input." },
+        { t: "Build the prompt", view: "chatnode", n: ["p_state", "sysprompt", "prep"], e: ["c1", "c2", "c3"], sel: "prep", cap: "<code>system.md</code> is filled with the memories and the time; the history is trimmed to <code>MAX_CONTEXT_TOKENS</code> with the system prompt first." },
+        { t: "Call the model, with fallback", view: "llm", n: ["callfn", "retry", "p_openai", "errclass", "bound", "reg"], e: ["l2", "l3", "l4", "l5", "l6", "l8"], sel: "errclass", cap: "Transient errors are retried, then the next model is tried; a bad request fails at once. Every model carries the tools, and nothing carries over to the next request." },
+        { t: "Run tools if asked", view: "agent", n: ["chatnode", "toolnode", "p_ddg", "state"], e: ["ag_chat_tool", "ag_tool_ddg", "ag_tool_chat", "ag_tool_state", "ag_chat_state"], sel: "toolnode", cap: "If the reply has tool calls, <code>tool_call</code> runs DuckDuckGo for each and loops back to <code>chat</code> with the results." },
+        { t: "Checkpoint every step", view: "agent", n: ["state", "saver", "p_ckpt", "graphinit"], e: ["ag_state_saver", "ag_saver_ckpt", "ag_init_saver"], sel: "saver", cap: "After each node the thread's state is written to Postgres under <code>thread_id</code> = session id. That is the conversation history." },
+        { t: "Return the thread", view: "agent", n: ["chatnode", "g_end", "out_proc", "p_resp"], e: ["ag_chat_end", "ag_end_out", "ag_out_resp"], sel: "out_proc", cap: "With no tool calls the graph ends. The route returns every user and assistant message in the thread." },
+        { t: "Remember the turn", view: "agent", n: ["g_end", "memupd", "p_mem0b"], e: ["ag_end_memupd", "ag_memupd_out"], sel: "memupd", cap: "Only this turn (the user message and the final reply) goes to mem0, from a task the agent keeps until it finishes." },
+        { t: "Logs, traces and metrics", view: "obs", n: ["otelinst", "logsys", "collector", "tempo", "loki", "metmod", "prometheus", "grafana"], e: ["o1", "o2", "o3", "o4", "o5", "o7", "o8", "o9"], sel: "collector", cap: "Spans go through the collector to Tempo, log lines with the same trace id to Loki, metrics to Prometheus; Grafana links all three." },
+        { t: "Score offline", view: "evals", n: ["cli", "fetch", "io", "judge", "push", "report"], e: ["v1", "v3", "v4", "v7", "v9"], sel: "judge", cap: "<code>make eval</code> pages through yesterday's unscored traces, has a judge model score each against five rubrics, and writes the scores back." }
+      ],
+      stream: [
+        { t: "Open a chat session", view: "auth", n: ["p_cli", "login", "sess", "getuser", "jwt"], e: ["a2", "a8", "a3", "a9", "a10", "a12"], sel: "sess", cap: "Log in for a user token, then trade it for a <b>session</b> token at <code>POST /auth/session</code>." },
+        { t: "Send a message", view: "system", n: ["client", "mw", "chatr"], e: ["r_req", "s_mw_chat"], sel: "r_req", cap: "<code>POST /api/v1/chatbot/chat/stream</code> with the same body as the blocking route." },
+        { t: "Pass the middleware", view: "http", n: ["p_in", "otelmw", "cors", "lcm", "mmw", "slowmw"], e: ["h1", "h1b", "h2", "h3", "h4", "h19"], sel: "mmw", cap: "Same order as the blocking route. The metrics timer runs until the last body byte, so the whole stream is measured." },
+        { t: "Authenticate, validate, limit", view: "http", n: ["bearer", "sessdep", "verify", "validate", "limiter", "handler"], e: ["h5", "h6", "h7", "h10", "h11", "h12"], sel: "limiter", cap: "Session token check, body validation, then 20 calls per minute per IP, counted in Redis." },
+        { t: "Build the run config", view: "agent", n: ["p_req", "cfg", "memsearch", "inp"], e: ["ag_req_cfg", "ag_req_mem", "ag_mem_inp", "ag_req_inp"], sel: "cfg", cap: "Thread id, a plain <code>CallbackHandler()</code>, and <code>langfuse_*</code> metadata so the trace is linked to the user and session." },
+        { t: "Stream from the chat node", view: "chatnode", n: ["prep", "llmcall", "p_stream"], e: ["c4", "c10"], sel: "p_stream", cap: "The node still calls <code>ainvoke</code>, but LangGraph's stream callback makes the model stream, and each chunk leaves immediately." },
+        { t: "Forward only the reply text", view: "agent", n: ["chatnode", "out_tok", "p_resp", "toolnode"], e: ["ag_chat_tok", "ag_tok_resp", "ag_chat_tool"], sel: "out_tok", cap: "Chunks from the chat node are reduced to text; tool output and reasoning blocks stay on the server." },
+        { t: "Frame as server-sent events", view: "http", n: ["handler", "resp", "p_out"], e: ["h14", "h15"], sel: "resp", cap: "<code>event_generator</code> writes one <code>data:</code> frame per chunk and a final <code>done: true</code> frame, or an <code>error</code> frame if the run failed." },
+        { t: "Checkpoint and remember", view: "agent", n: ["state", "saver", "memupd", "p_mem0b"], e: ["ag_state_saver", "ag_end_memupd", "ag_memupd_out"], sel: "memupd", cap: "Checkpoints are written as the graph runs. After the last chunk, the final reply is read back and the turn goes to mem0." },
+        { t: "Logs, traces and metrics", view: "obs", n: ["otelinst", "logsys", "collector", "tempo", "loki", "metmod", "prometheus", "grafana"], e: ["o1", "o2", "o3", "o4", "o5"], sel: "logsys", cap: "Every log line of the stream carries its trace id; Grafana jumps from a Loki line to the Tempo trace." }
+      ]
+    }
+  };
+
+  ArchExplorer(document.getElementById("arch"), SPEC);
+})();
+</script>
+</body>
+</html>
